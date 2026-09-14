@@ -8,13 +8,14 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import (Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
+    CallbackQueryHandler,
 )
 
 # =========================================================
@@ -130,6 +131,13 @@ def init_admin_table():
         """,
         (ADMIN_ID,)
     )
+
+    query("ALTER TABLE buttons ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT FALSE")
+    query("""CREATE TABLE IF NOT EXISTS button_clicks (
+        id BIGSERIAL PRIMARY KEY, button_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
+        clicked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    query("CREATE INDEX IF NOT EXISTS idx_button_clicks_button ON button_clicks(button_id, clicked_at)")
 
     # -----------------------------------------------------
     # FILE DATE/PERIOD + USER DOWNLOAD TRACKING
@@ -272,82 +280,32 @@ def is_admin(update):
 # =========================================================
 
 def admin_keyboard():
-
-    return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("➕ افزودن دکمه"),
-                KeyboardButton("🛠 مدیریت دکمه‌ها")
-            ],
-            [
-                KeyboardButton("✏️ متن /start"),
-                KeyboardButton("📊 آمار کاربران")
-            ],
-            [
-                KeyboardButton("📢 ارسال همگانی"),
-                KeyboardButton("👥 مدیریت ادمین‌ها")
-            ],
-            [
-                KeyboardButton("🗑 حذف فایل"),
-                KeyboardButton("👤 منوی کاربر")
-            ],
-        ],
-        resize_keyboard=True
-    )
-
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن دکمه", callback_data="adm:addbtn"), InlineKeyboardButton("🛠 مدیریت دکمه‌ها", callback_data="adm:buttons")],
+        [InlineKeyboardButton("📁 مدیریت فایل‌ها", callback_data="adm:files"), InlineKeyboardButton("📊 آمار و گزارش", callback_data="adm:stats")],
+        [InlineKeyboardButton("✏️ متن /start", callback_data="adm:starttext"), InlineKeyboardButton("⚙️ تنظیمات", callback_data="adm:settings")],
+        [InlineKeyboardButton("📢 ارسال همگانی", callback_data="adm:broadcast"), InlineKeyboardButton("👥 ادمین‌ها", callback_data="adm:admins")],
+        [InlineKeyboardButton("👤 پیش‌نمایش کاربر", callback_data="adm:userpreview")]
+    ])
 
 def admin_management_keyboard():
-
-    return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("➕ افزودن ادمین"),
-                KeyboardButton("🗑 حذف ادمین")
-            ],
-            [
-                KeyboardButton("👥 لیست ادمین‌ها")
-            ],
-            [
-                KeyboardButton("🔙 لغو / بازگشت")
-            ]
-        ],
-        resize_keyboard=True
-    )
-
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm:addadmin"), InlineKeyboardButton("🗑 حذف ادمین", callback_data="adm:removeadmin")],
+        [InlineKeyboardButton("👥 لیست ادمین‌ها", callback_data="adm:listadmins")],
+        [InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")]
+    ])
 
 def button_management_keyboard():
-
-    return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("➕ افزودن دکمه اصلی"),
-                KeyboardButton("➕ افزودن زیرمنو")
-            ],
-            [
-                KeyboardButton("✏️ تغییر نام"),
-                KeyboardButton("📁 تغییر فایل / پیام")
-            ],
-            [
-                KeyboardButton("🗑 حذف دکمه")
-            ],
-            [
-                KeyboardButton("🔙 لغو / بازگشت")
-            ]
-        ],
-        resize_keyboard=True
-    )
-
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ دکمه اصلی", callback_data="adm:addbtn"), InlineKeyboardButton("➕ زیرمنو", callback_data="adm:addsubmenu")],
+        [InlineKeyboardButton("✏️ تغییر نام", callback_data="adm:rename"), InlineKeyboardButton("📁 افزودن فایل/پیام", callback_data="adm:addfile")],
+        [InlineKeyboardButton("👁 نمایش/مخفی", callback_data="adm:visibility"), InlineKeyboardButton("↕️ مرتب‌سازی", callback_data="adm:sort")],
+        [InlineKeyboardButton("🗑 حذف دکمه", callback_data="adm:deletebtn"), InlineKeyboardButton("📊 آمار دکمه‌ها", callback_data="adm:buttonstats")],
+        [InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")]
+    ])
 
 def back_keyboard():
-
-    return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("🔙 لغو / بازگشت")
-            ]
-        ],
-        resize_keyboard=True
-    )
+    return ReplyKeyboardRemove()
 
 
 # =========================================================
@@ -355,89 +313,26 @@ def back_keyboard():
 # =========================================================
 
 def user_keyboard(parent_id=None, page=0):
-
-    buttons = query(
-        """
-        SELECT id, title, kind
-        FROM buttons
+    buttons=query("""SELECT id,title,kind FROM buttons
         WHERE parent_id IS NOT DISTINCT FROM %s
-        ORDER BY sort_order, id
-        """,
-        (parent_id,),
-        fetch=True
-    )
-
-    per_page = 8
-
-    start = page * per_page
-
-    current = buttons[
-        start:start + per_page
-    ]
-
-    keyboard = []
-
-    # Fixed file shortcuts at the main/root menu.
-    # They do not replace the admin-created buttons below.
+          AND COALESCE(hidden,FALSE)=FALSE
+        ORDER BY sort_order,id""",(parent_id,),fetch=True)
+    per_page=8; start=page*per_page; current=buttons[start:start+per_page]; kb=[]
     if parent_id is None:
-        keyboard.extend([
-            [KeyboardButton("🆕 تازه‌ترین فایل‌ها")],
-            [KeyboardButton("📅 فایل‌های امروز")],
-            [KeyboardButton("📆 فایل‌های این هفته")],
-            [KeyboardButton("📥 فایل‌های من")],
-            [KeyboardButton("📥 دانلود همه فایل‌ها")],
-        ])
-
-    for button in current:
-
-        keyboard.append(
-            [
-                KeyboardButton(
-                    button["title"]
-                )
-            ]
-        )
-
-    navigation = []
-
-    if page > 0:
-
-        navigation.append(
-            KeyboardButton(
-                "⬅️ صفحه قبل"
-            )
-        )
-
-    if start + per_page < len(buttons):
-
-        navigation.append(
-            KeyboardButton(
-                "➡️ صفحه بعد"
-            )
-        )
-
-    if navigation:
-
-        keyboard.append(navigation)
-
-    if parent_id is not None:
-
-        keyboard.append(
-            [
-                KeyboardButton(
-                    "🔙 بازگشت"
-                )
-            ]
-        )
-
-    return (
-        ReplyKeyboardMarkup(
-            keyboard,
-            resize_keyboard=True
-        ),
-        current,
-        len(buttons)
-    )
+        kb += [[InlineKeyboardButton("🆕 تازه‌ترین فایل‌ها",callback_data="uf:latest")],
+               [InlineKeyboardButton("📅 امروز",callback_data="uf:today"),InlineKeyboardButton("📆 این هفته",callback_data="uf:week")],
+               [InlineKeyboardButton("📥 فایل‌های من",callback_data="uf:mine_menu")],
+               [InlineKeyboardButton("🔎 جستجوی فایل",callback_data="uf:search")],
+               [InlineKeyboardButton("📥 دانلود همه فایل‌ها",callback_data="uf:all")]]
+    for b in current:
+        icon="📂" if b["kind"]=="menu" else ("📄" if b["kind"]=="file" else "🔹")
+        kb.append([InlineKeyboardButton(f"{icon} {b['title']}",callback_data=f"ub:{b['id']}")])
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("⬅️ صفحه قبل",callback_data=f"up:{parent_id or 0}:{page-1}"))
+    if start+per_page<len(buttons): nav.append(InlineKeyboardButton("➡️ صفحه بعد",callback_data=f"up:{parent_id or 0}:{page+1}"))
+    if nav: kb.append(nav)
+    if parent_id is not None: kb.append([InlineKeyboardButton("🔙 بازگشت",callback_data="uback")])
+    return InlineKeyboardMarkup(kb),current,len(buttons)
 
 
 # =========================================================
@@ -528,7 +423,7 @@ def get_filtered_files(mode="latest", user_id=None, limit=None):
 
 async def send_file_rows(update, context, rows, heading, mark_download=True):
     if not rows:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             heading + "\n\n❌ فایلی در این بخش وجود ندارد."
         )
         return 0, 0
@@ -537,7 +432,7 @@ async def send_file_rows(update, context, rows, heading, mark_download=True):
     failed = 0
     user_id = update.effective_user.id if update.effective_user else None
 
-    await update.message.reply_text(heading)
+    await update.effective_message.reply_text(heading)
 
     for row in rows:
         try:
@@ -560,7 +455,7 @@ async def send_file_rows(update, context, rows, heading, mark_download=True):
             )
 
     if failed:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"✅ ارسال شد: {success}\n"
             f"❌ ارسال نشد: {failed}"
         )
@@ -599,6 +494,7 @@ async def show_file_section(update, context, mode):
         return
 
     await send_file_rows(update, context, rows, heading)
+    await update.effective_message.reply_text("",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 فایل‌های من",callback_data="uf:mine_menu"),InlineKeyboardButton("🏠 خانه",callback_data="uhome")]]))
 
 
 # =========================================================
@@ -606,23 +502,14 @@ async def show_file_section(update, context, mode):
 # =========================================================
 
 def my_files_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("🆕 فایل‌های جدید")],
-            [KeyboardButton("📥 دانلود همه فایل‌ها")],
-            [KeyboardButton("✅ فایل‌های دریافت‌شده")],
-            [KeyboardButton("🔙 برگشت")],
-        ],
-        resize_keyboard=True
-    )
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🆕 فایل‌های جدید",callback_data="uf:mine")],
+        [InlineKeyboardButton("📥 دانلود همه فایل‌ها",callback_data="uf:all")],
+        [InlineKeyboardButton("✅ فایل‌های دریافت‌شده",callback_data="uf:received")],
+        [InlineKeyboardButton("🔙 خانه",callback_data="uhome")]])
 
-
-async def show_my_files_menu(update, context):
-    context.user_data["my_files_menu"] = True
-    await update.message.reply_text(
-        "📥 فایل‌های من\n\nیکی از گزینه‌ها را انتخاب کنید:",
-        reply_markup=my_files_keyboard()
-    )
+async def show_my_files_menu(update,context):
+    context.user_data["my_files_menu"]=True
+    await update.effective_message.reply_text("📥 فایل‌های من\n\nیکی از گزینه‌ها را انتخاب کن:",reply_markup=my_files_keyboard())
 
 
 # =========================================================
@@ -648,7 +535,7 @@ async def delete_file_start(update, context):
     )
 
     if not rows:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ هیچ فایلی ثبت نشده است.",
             reply_markup=admin_keyboard()
         )
@@ -669,7 +556,7 @@ async def delete_file_start(update, context):
         admin_section="main"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "🗑 فایل موردنظر را برای حذف انتخاب کن:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
@@ -796,7 +683,7 @@ async def start(update, context):
 
     keyboard, _, _ = user_keyboard()
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         get_start_text(),
         reply_markup=keyboard
     )
@@ -813,7 +700,7 @@ async def admin_command(update, context):
 
     context.user_data.clear()
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "⚙️ پنل مدیریت ربات",
         reply_markup=admin_keyboard()
     )
@@ -827,7 +714,7 @@ async def show_root(update):
 
     keyboard, _, _ = user_keyboard()
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         get_start_text(),
         reply_markup=keyboard
     )
@@ -964,7 +851,7 @@ async def add_button_start(update, context):
         admin_section="button_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "➕ نام دکمه را بفرست:",
         reply_markup=back_keyboard()
     )
@@ -993,7 +880,7 @@ async def ask_button_type(update, context):
         resize_keyboard=True
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "نوع دکمه را انتخاب کن:",
         reply_markup=keyboard
     )
@@ -1017,7 +904,7 @@ async def add_child_start(update, context):
 
     if not menus:
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ هنوز هیچ منوی فرعی ساخته نشده است.",
             reply_markup=button_management_keyboard()
         )
@@ -1050,7 +937,7 @@ async def add_child_start(update, context):
         admin_section="button_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "📂 منوی والد را انتخاب کن:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
@@ -1071,7 +958,7 @@ async def management_menu(update, context):
         "button_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "🛠 مدیریت دکمه‌ها:",
         reply_markup=button_management_keyboard()
     )
@@ -1094,7 +981,7 @@ async def rename_start(update, context):
 
     if not buttons:
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ هنوز دکمه‌ای ساخته نشده.",
             reply_markup=button_management_keyboard()
         )
@@ -1124,7 +1011,7 @@ async def rename_start(update, context):
         admin_section="button_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "✏️ دکمه‌ای که می‌خواهی تغییر نام بده انتخاب کن:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
@@ -1150,7 +1037,7 @@ async def delete_start(update, context):
 
     if not buttons:
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ هنوز دکمه‌ای ساخته نشده.",
             reply_markup=button_management_keyboard()
         )
@@ -1180,7 +1067,7 @@ async def delete_start(update, context):
         admin_section="button_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "🗑 دکمه‌ای که می‌خواهی حذف کنی انتخاب کن:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
@@ -1207,7 +1094,7 @@ async def change_file_start(update, context):
 
     if not buttons:
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ هنوز هیچ دکمه فایل / پیام ساخته نشده است.",
             reply_markup=button_management_keyboard()
         )
@@ -1240,7 +1127,7 @@ async def change_file_start(update, context):
         admin_section="button_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "📁 دکمه‌ای را انتخاب کن تا فایل یا پیام جدید به آن اضافه شود:\n\n"
         "⚠️ فایل‌های قبلی حذف یا جایگزین نمی‌شوند.",
         reply_markup=ReplyKeyboardMarkup(
@@ -1262,7 +1149,7 @@ async def edit_start_text(update, context):
         admin_section="main"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "✏️ متن فعلی:\n\n"
         + get_start_text()
         + "\n\n"
@@ -1286,7 +1173,7 @@ async def statistics(update, context):
         one=True
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"📊 تعداد کاربران: {result['total']}",
         reply_markup=admin_keyboard()
     )
@@ -1304,7 +1191,7 @@ async def broadcast_start(update, context):
         admin_section="main"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "📢 حالا هر چیزی که می‌خواهی برای کاربران ارسال شود بفرست.\n\n"
         "متن، عکس، ویدیو، PDF، فایل، صوت و غیره.",
         reply_markup=back_keyboard()
@@ -1319,7 +1206,7 @@ async def admin_management(update, context):
 
     if not is_main_admin(update):
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ فقط ادمین اصلی می‌تواند ادمین‌ها را مدیریت کند."
         )
 
@@ -1331,7 +1218,7 @@ async def admin_management(update, context):
         "admin_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "👥 مدیریت ادمین‌ها\n\n"
         "از گزینه‌های زیر استفاده کن:",
         reply_markup=admin_management_keyboard()
@@ -1349,7 +1236,7 @@ async def add_admin_start(update, context):
         admin_section="admin_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "➕ آیدی عددی کاربر را بفرست.\n\n"
         "مثال:\n"
         "123456789",
@@ -1373,7 +1260,7 @@ async def remove_admin_start(update, context):
 
     if not admins:
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ هیچ ادمینی وجود ندارد.",
             reply_markup=admin_management_keyboard()
         )
@@ -1416,7 +1303,7 @@ async def remove_admin_start(update, context):
         admin_section="admin_management"
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "🗑 ادمینی که می‌خواهی حذف کنی انتخاب کن:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
@@ -1441,7 +1328,7 @@ async def admin_list(update, context):
 
     if not admins:
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ هیچ ادمینی ثبت نشده.",
             reply_markup=admin_management_keyboard()
         )
@@ -1469,7 +1356,7 @@ async def admin_list(update, context):
                 f"{index}. 👤 {user_id}\n"
             )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         text,
         reply_markup=admin_management_keyboard()
     )
@@ -1484,7 +1371,7 @@ async def handle_admin_state(update, context):
     if not is_admin(update):
         return False
 
-    message = update.message
+    message = update.effective_message
 
     if not message:
         return False
@@ -2496,10 +2383,10 @@ async def admin_text_router(update, context):
     if not is_admin(update):
         return False
 
-    if not update.message:
+    if not update.effective_message:
         return False
 
-    text = update.message.text or ""
+    text = update.effective_message.text or ""
 
     state = context.user_data.get(
         "state"
@@ -2534,7 +2421,7 @@ async def admin_text_router(update, context):
 
         if section == "button_management":
 
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "⚙️ پنل مدیریت",
                 reply_markup=admin_keyboard()
             )
@@ -2543,14 +2430,14 @@ async def admin_text_router(update, context):
 
         if section == "admin_management":
 
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "⚙️ پنل مدیریت",
                 reply_markup=admin_keyboard()
             )
 
             return True
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "⚙️ پنل مدیریت",
             reply_markup=admin_keyboard()
         )
@@ -2715,16 +2602,22 @@ async def admin_text_router(update, context):
     return False
 
 
+    if context.user_data.get("state") == "sort_button":
+        try: order=int(text.strip())
+        except ValueError: await message.reply_text("❌ فقط عدد وارد کن."); return True
+        query("UPDATE buttons SET sort_order=%s WHERE id=%s",(order,context.user_data.get("sort_button_id")))
+        context.user_data.clear(); context.user_data["admin_section"]="button_management"; await message.reply_text("✅ ترتیب ذخیره شد.",reply_markup=button_management_keyboard()); return True
+
 # =========================================================
 # USER ROUTER
 # =========================================================
 
 async def user_router(update, context):
 
-    if not update.message:
+    if not update.effective_message:
         return
 
-    if not update.message.text:
+    if not update.effective_message.text:
         return
 
     if is_admin(update):
@@ -2739,7 +2632,13 @@ async def user_router(update, context):
 
     await save_user(update)
 
-    text = update.message.text
+    text = update.effective_message.text
+
+    if context.user_data.get("state") == "search_files":
+        term=(text or "").strip()
+        if not term: await update.effective_message.reply_text("❌ عبارت جستجو خالی است."); return
+        rows=query("SELECT bf.id,bf.source_chat_id,bf.source_message_id,b.title AS button_title FROM button_files bf JOIN buttons b ON b.id=bf.button_id WHERE b.title ILIKE %s OR COALESCE(b.value,'') ILIKE %s ORDER BY bf.added_at DESC LIMIT 30",(f"%{term}%",f"%{term}%"),fetch=True)
+        context.user_data.clear(); await send_file_rows(update,context,rows,f"🔎 نتایج جستجو: {term}"); await update.effective_message.reply_text("",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 خانه",callback_data="uhome")]])); return
 
     # =====================================================
     # USER BACK
@@ -2812,7 +2711,7 @@ async def user_router(update, context):
             page
         )
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "📄 صفحه",
             reply_markup=keyboard
         )
@@ -2896,7 +2795,7 @@ async def user_router(update, context):
             0
         )
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "📂 منوی انتخاب‌شده:",
             reply_markup=keyboard
         )
@@ -2926,7 +2825,7 @@ async def user_router(update, context):
 
         if not files:
 
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "❌ هیچ فایل یا پیامی برای این دکمه ثبت نشده است."
             )
 
@@ -2990,13 +2889,13 @@ async def user_router(update, context):
 
         if success == 0:
 
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "❌ فایل‌ها دیگر قابل دریافت نیستند."
             )
 
         elif failed > 0:
 
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"⚠️ {success} فایل ارسال شد و "
                 f"{failed} فایل ارسال نشد."
             )
@@ -3009,7 +2908,7 @@ async def user_router(update, context):
 
     if button["kind"] == "text":
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             button["value"] or ""
         )
 
@@ -3021,7 +2920,7 @@ async def user_router(update, context):
 
     if button["kind"] == "link":
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             button["value"] or ""
         )
 
@@ -3029,12 +2928,86 @@ async def user_router(update, context):
 
 
 # =========================================================
+# INLINE CALLBACKS
+# =========================================================
+async def callback_router(update, context):
+    q=update.callback_query
+    if not q: return
+    data=q.data or ""
+    if data=="uhome":
+        await q.answer(); context.user_data.clear(); kb,_,_=user_keyboard(); await q.message.reply_text(get_start_text(),reply_markup=kb); return
+    if data=="uf:mine_menu":
+        await q.answer(); await show_my_files_menu(update,context); return
+    if data.startswith("uf:"):
+        mode=data.split(":",1)[1]; await q.answer()
+        if mode=="search":
+            context.user_data.clear(); context.user_data["state"]="search_files"; await q.message.reply_text("🔎 نام مضمون، عنوان یا کلمه موردنظر را بفرست:",reply_markup=ReplyKeyboardRemove()); return
+        if mode in ("latest","today","week","mine","received","all"):
+            await show_file_section(update,context,mode); return
+    if data=="uback":
+        await q.answer(); context.user_data["menu_parent"]=None; context.user_data["menu_page"]=0; kb,_,_=user_keyboard(); await q.message.reply_text(get_start_text(),reply_markup=kb); return
+    if data.startswith("up:"):
+        await q.answer(); _,pid,page=data.split(":",2); pid=None if pid=="0" else int(pid); kb,_,_=user_keyboard(pid,int(page)); await q.message.reply_text("📄 صفحه:",reply_markup=kb); return
+    if data.startswith("ub:"):
+        await q.answer(); bid=int(data.split(":",1)[1]); row=query("SELECT * FROM buttons WHERE id=%s AND COALESCE(hidden,FALSE)=FALSE",(bid,),fetch=True,one=True)
+        if not row: await q.message.reply_text("❌ این دکمه دیگر موجود نیست."); return
+        if update.effective_user: query("INSERT INTO button_clicks(button_id,user_id) VALUES(%s,%s)",(bid,update.effective_user.id))
+        if row["kind"]=="menu":
+            context.user_data["menu_parent"]=bid; context.user_data["menu_page"]=0; kb,_,_=user_keyboard(bid,0); await q.message.reply_text("📂 "+(row["title"] or "منو"),reply_markup=kb); return
+        if row["kind"] in ("text","link"):
+            await q.message.reply_text(row["value"] or ""); return
+        if row["kind"]=="file":
+            files=query("SELECT id,source_chat_id,source_message_id FROM button_files WHERE button_id=%s ORDER BY id",(bid,),fetch=True); ok=0
+            for f in files:
+                try:
+                    await context.bot.copy_message(q.message.chat_id,f["source_chat_id"],f["source_message_id"]); ok+=1
+                    if update.effective_user: mark_file_downloaded(update.effective_user.id,f["id"])
+                    await asyncio.sleep(.05)
+                except Exception as e: logger.warning("Inline file copy failed: %s",e)
+            await q.message.reply_text(f"✅ {ok} فایل ارسال شد."); return
+    if not is_admin(update): await q.answer("دسترسی ندارید.",show_alert=True); return
+    await q.answer()
+    if data=="adm:home": context.user_data.clear(); await q.message.reply_text("⚙️ پنل پیشرفته مدیریت",reply_markup=admin_keyboard()); return
+    if data=="adm:buttons": context.user_data.clear(); context.user_data["admin_section"]="button_management"; await q.message.reply_text("🛠 مدیریت پیشرفته دکمه‌ها",reply_markup=button_management_keyboard()); return
+    if data=="adm:files":
+        r=query("SELECT COUNT(*) AS total,COUNT(*) FILTER(WHERE added_at::date=CURRENT_DATE) AS today,COUNT(*) FILTER(WHERE added_at>=date_trunc('week',CURRENT_TIMESTAMP)) AS week FROM button_files",fetch=True,one=True)
+        await q.message.reply_text(f"📁 مدیریت فایل‌ها\\n\\n📦 کل: {r['total']}\\n📅 امروز: {r['today']}\\n📆 این هفته: {r['week']}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ افزودن فایل",callback_data="adm:addfile")],[InlineKeyboardButton("🗑 حذف فایل",callback_data="adm:deletefile")],[InlineKeyboardButton("🔙 پنل اصلی",callback_data="adm:home")]])); return
+    if data=="adm:stats":
+        r=query("SELECT COUNT(*) n FROM users",fetch=True,one=True); b=query("SELECT COUNT(*) n FROM buttons",fetch=True,one=True); f=query("SELECT COUNT(*) n FROM button_files",fetch=True,one=True); c=query("SELECT COUNT(*) n FROM button_clicks",fetch=True,one=True)
+        await q.message.reply_text(f"📊 گزارش کلی\\n\\n👥 کاربران: {r['n']}\\n🧩 دکمه‌ها: {b['n']}\\n📄 فایل‌ها: {f['n']}\\n🖱 کلیک‌ها: {c['n']}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 پنل اصلی",callback_data="adm:home")]])); return
+    if data=="adm:settings":
+        await q.message.reply_text("⚙️ تنظیمات پیشرفته",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👁 نمایش/مخفی دکمه",callback_data="adm:visibility")],[InlineKeyboardButton("↕️ مرتب‌سازی دکمه‌ها",callback_data="adm:sort")],[InlineKeyboardButton("📊 آمار دکمه‌ها",callback_data="adm:buttonstats")],[InlineKeyboardButton("🔙 پنل اصلی",callback_data="adm:home")]])); return
+    if data=="adm:userpreview": kb,_,_=user_keyboard(); await q.message.reply_text("👤 پیش‌نمایش منوی کاربر",reply_markup=kb); return
+    if data=="adm:starttext": set_state(context,"start_text",admin_section="main"); await q.message.reply_text("✏️ متن جدید /start را بفرست:",reply_markup=ReplyKeyboardRemove()); return
+    if data=="adm:broadcast": set_state(context,"broadcast",admin_section="main"); await q.message.reply_text("📢 پیام همگانی را بفرست:",reply_markup=ReplyKeyboardRemove()); return
+    if data=="adm:addbtn": set_state(context,"add_name",parent_id=None,admin_section="button_management"); await q.message.reply_text("➕ نام دکمه را بفرست:",reply_markup=ReplyKeyboardRemove()); return
+    if data=="adm:addsubmenu": await add_child_start(update,context); return
+    if data=="adm:rename": await rename_start(update,context); return
+    if data=="adm:addfile": await change_file_start(update,context); return
+    if data=="adm:deletebtn": await delete_start(update,context); return
+    if data=="adm:deletefile": await delete_file_start(update,context); return
+    if data=="adm:addadmin": await add_admin_start(update,context); return
+    if data=="adm:removeadmin": await remove_admin_start(update,context); return
+    if data=="adm:listadmins": await admin_list(update,context); return
+    if data=="adm:admins": context.user_data.clear(); context.user_data["admin_section"]="admin_management"; await q.message.reply_text("👥 مدیریت ادمین‌ها",reply_markup=admin_management_keyboard()); return
+    if data=="adm:buttonstats":
+        rows=query("SELECT b.title,COUNT(c.id) clicks FROM buttons b LEFT JOIN button_clicks c ON c.button_id=b.id GROUP BY b.id ORDER BY clicks DESC,b.id DESC LIMIT 30",fetch=True); text="📊 آمار دکمه‌ها\\n\\n"+"\\n".join(f"{i}. {r['title']} — {r['clicks']} کلیک" for i,r in enumerate(rows,1)) if rows else "❌ دکمه‌ای وجود ندارد."; await q.message.reply_text(text,reply_markup=button_management_keyboard()); return
+    if data=="adm:visibility":
+        rows=query("SELECT id,title,COALESCE(hidden,FALSE) hidden FROM buttons ORDER BY parent_id NULLS FIRST,sort_order,id",fetch=True); kb=[[InlineKeyboardButton(("🚫 " if r['hidden'] else "✅ ")+str(r['title']),callback_data=f"btv:{r['id']}")] for r in rows[:50]]+[ [InlineKeyboardButton("🔙 برگشت",callback_data="adm:buttons")] ]; await q.message.reply_text("👁 وضعیت نمایش را انتخاب کن:",reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("btv:"):
+        bid=int(data.split(":",1)[1]); query("UPDATE buttons SET hidden=NOT COALESCE(hidden,FALSE) WHERE id=%s",(bid,)); await q.message.reply_text("✅ وضعیت نمایش تغییر کرد.",reply_markup=button_management_keyboard()); return
+    if data=="adm:sort":
+        rows=query("SELECT id,title,sort_order FROM buttons ORDER BY parent_id NULLS FIRST,sort_order,id",fetch=True); kb=[[InlineKeyboardButton(f"↕️ {r['title']} ({r['sort_order']})",callback_data=f"bts:{r['id']}")] for r in rows[:50]]+[[InlineKeyboardButton("🔙 برگشت",callback_data="adm:buttons")]]; await q.message.reply_text("دکمه را انتخاب کن:",reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("bts:"):
+        bid=int(data.split(":",1)[1]); context.user_data.clear(); context.user_data.update({"state":"sort_button","sort_button_id":bid,"admin_section":"button_management"}); await q.message.reply_text("↕️ شماره ترتیب جدید را بفرست:",reply_markup=ReplyKeyboardRemove()); return
+
+# =========================================================
 # ALL MESSAGES
 # =========================================================
 
 async def all_messages(update, context):
 
-    if not update.message:
+    if not update.effective_message:
         return
 
     if is_admin(update):
@@ -3134,6 +3107,8 @@ async def main():
             admin_command
         )
     )
+
+    application.add_handler(CallbackQueryHandler(callback_router))
 
     application.add_handler(
         MessageHandler(
