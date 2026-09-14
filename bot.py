@@ -1636,20 +1636,39 @@ async def handle_admin_state(update, context):
 
     if state == "change_file":
 
-        button_id = context.user_data.get(
-            "button_id"
+    button_id = context.user_data.get(
+        "button_id"
+    )
+
+    if not button_id:
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "❌ خطا در انتخاب دکمه.",
+            reply_markup=button_management_keyboard()
         )
 
-        if not button_id:
+        return True
 
-            context.user_data.clear()
+    await add_file_to_button(
+        button_id=button_id,
+        source_chat_id=message.chat_id,
+        source_message_id=message.message_id
+    )
 
-            await message.reply_text(
-                "❌ خطا در انتخاب دکمه.",
-                reply_markup=button_management_keyboard()
-            )
+    # -------------------------------------------------
+    # SUCCESS MESSAGE
+    # -------------------------------------------------
 
-            return True
+    await message.reply_text(
+        "✅ فایل / پیام با موفقیت ثبت شد.\n\n"
+        "📁 فایل‌های قبلی همچنان باقی هستند.\n"
+        "➕ فایل بعدی را هم می‌توانی ارسال کنی.\n\n"
+        "🔙 وقتی تمام شد، «لغو / بازگشت» را بزن."
+    )
+
+    return True
 
         # -------------------------------------------------
         # ADD EVERY NEW MESSAGE AS A NEW FILE
