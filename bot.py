@@ -25,6 +25,10 @@ TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# Optional: set TELEGRAM_CHANNEL_ID to a channel chat id such as -1001234567890.
+# The bot must be an administrator with permission to post messages.
+CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
+
 PUBLIC_URL = (
     os.environ.get("WEBHOOK_URL")
     or os.environ.get("RENDER_EXTERNAL_URL")
@@ -125,6 +129,41 @@ def init_admin_table():
         ON CONFLICT (user_id) DO NOTHING
         """,
         (ADMIN_ID,)
+    )
+
+    # -----------------------------------------------------
+    # FILE DATE/PERIOD + USER DOWNLOAD TRACKING
+    # -----------------------------------------------------
+    query(
+        """
+        ALTER TABLE button_files
+        ADD COLUMN IF NOT EXISTS period VARCHAR(20) DEFAULT 'normal'
+        """
+    )
+
+    query(
+        """
+        ALTER TABLE button_files
+        ADD COLUMN IF NOT EXISTS added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        """
+    )
+
+    query(
+        """
+        CREATE TABLE IF NOT EXISTS user_file_downloads (
+            user_id BIGINT NOT NULL,
+            file_id BIGINT NOT NULL,
+            downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, file_id)
+        )
+        """
+    )
+
+    query(
+        """
+        CREATE INDEX IF NOT EXISTS idx_button_files_period
+        ON button_files(period, added_at)
+        """
     )
 
     # -----------------------------------------------------
@@ -249,6 +288,7 @@ def admin_keyboard():
                 KeyboardButton("👥 مدیریت ادمین‌ها")
             ],
             [
+                KeyboardButton("🗑 حذف فایل"),
                 KeyboardButton("👤 منوی کاربر")
             ],
         ],
@@ -337,6 +377,17 @@ def user_keyboard(parent_id=None, page=0):
 
     keyboard = []
 
+    # Fixed file shortcuts at the main/root menu.
+    # They do not replace the admin-created buttons below.
+    if parent_id is None:
+        keyboard.extend([
+            [KeyboardButton("🆕 تازه‌ترین فایل‌ها")],
+            [KeyboardButton("📅 فایل‌های امروز")],
+            [KeyboardButton("📆 فایل‌های این هفته")],
+            [KeyboardButton("📥 فایل‌های من")],
+            [KeyboardButton("📥 دانلود همه فایل‌ها")],
+        ])
+
     for button in current:
 
         keyboard.append(
@@ -386,6 +437,244 @@ def user_keyboard(parent_id=None, page=0):
         ),
         current,
         len(buttons)
+    )
+
+
+# =========================================================
+# FILE FILTER / DOWNLOAD HELPERS
+# =========================================================
+
+def mark_file_downloaded(user_id, file_id):
+    query(
+        """
+        INSERT INTO user_file_downloads (user_id, file_id)
+        VALUES (%s, %s)
+        ON CONFLICT (user_id, file_id) DO NOTHING
+        """,
+        (user_id, file_id)
+    )
+
+
+def get_filtered_files(mode="latest", user_id=None, limit=None):
+    """
+    mode:
+      latest = newest files
+      today = files added today
+      week = files added in current week
+      mine = files not downloaded by this user
+      received = files already sent to this user
+      all = all files
+    """
+    where = ""
+    params = []
+
+    if mode == "today":
+        where = """
+            AND bf.added_at::date = CURRENT_DATE
+        """
+    elif mode == "week":
+        where = """
+            AND bf.added_at >= date_trunc('week', CURRENT_TIMESTAMP)
+            AND bf.added_at < date_trunc('week', CURRENT_TIMESTAMP) + INTERVAL '7 days'
+        """
+    elif mode == "mine":
+        where = """
+            AND %s IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                FROM user_file_downloads ufd
+                WHERE ufd.user_id = %s
+                  AND ufd.file_id = bf.id
+            )
+        """
+        params.extend([user_id, user_id])
+    elif mode == "received":
+        where = """
+            AND %s IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM user_file_downloads ufd
+                WHERE ufd.user_id = %s
+                  AND ufd.file_id = bf.id
+            )
+        """
+        params.extend([user_id, user_id])
+
+    limit_sql = ""
+    if limit:
+        limit_sql = " LIMIT %s"
+        params.append(limit)
+
+    return query(
+        f"""
+        SELECT
+            bf.id,
+            bf.source_chat_id,
+            bf.source_message_id,
+            bf.added_at,
+            bf.period,
+            b.title AS button_title
+        FROM button_files bf
+        JOIN buttons b ON b.id = bf.button_id
+        WHERE 1=1
+        {where}
+        ORDER BY bf.added_at DESC, bf.id DESC
+        {limit_sql}
+        """,
+        tuple(params),
+        fetch=True
+    )
+
+
+async def send_file_rows(update, context, rows, heading, mark_download=True):
+    if not rows:
+        await update.message.reply_text(
+            heading + "\n\n❌ فایلی در این بخش وجود ندارد."
+        )
+        return 0, 0
+
+    success = 0
+    failed = 0
+    user_id = update.effective_user.id if update.effective_user else None
+
+    await update.message.reply_text(heading)
+
+    for row in rows:
+        try:
+            await context.bot.copy_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=row["source_chat_id"],
+                message_id=row["source_message_id"]
+            )
+            success += 1
+            if mark_download and user_id is not None:
+                mark_file_downloaded(user_id, row["id"])
+            # Keep bulk sending below Telegram's normal burst limit.
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logger.warning(
+                "File send failed for file_id=%s: %s",
+                row["id"],
+                e
+            )
+
+    if failed:
+        await update.message.reply_text(
+            f"✅ ارسال شد: {success}\n"
+            f"❌ ارسال نشد: {failed}"
+        )
+
+    return success, failed
+
+
+async def show_file_section(update, context, mode):
+    if mode == "latest":
+        rows = get_filtered_files("latest", limit=10)
+        heading = "🆕 تازه‌ترین فایل‌ها (۱۰ فایل آخر)"
+    elif mode == "today":
+        rows = get_filtered_files("today")
+        heading = "📅 فایل‌های امروز"
+    elif mode == "week":
+        rows = get_filtered_files("week")
+        heading = "📆 فایل‌های این هفته"
+    elif mode == "mine":
+        rows = get_filtered_files(
+            "mine",
+            user_id=update.effective_user.id,
+            limit=50
+        )
+        heading = "🆕 فایل‌های دریافت‌نشده شما"
+    elif mode == "received":
+        rows = get_filtered_files(
+            "received",
+            user_id=update.effective_user.id,
+            limit=50
+        )
+        heading = "✅ فایل‌های دریافت‌شده شما"
+    elif mode == "all":
+        rows = get_filtered_files("all")
+        heading = "📥 همه فایل‌ها"
+    else:
+        return
+
+    await send_file_rows(update, context, rows, heading)
+
+
+# =========================================================
+# MY FILES MENU
+# =========================================================
+
+def my_files_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🆕 فایل‌های جدید")],
+            [KeyboardButton("📥 دانلود همه فایل‌ها")],
+            [KeyboardButton("✅ فایل‌های دریافت‌شده")],
+            [KeyboardButton("🔙 برگشت")],
+        ],
+        resize_keyboard=True
+    )
+
+
+async def show_my_files_menu(update, context):
+    context.user_data["my_files_menu"] = True
+    await update.message.reply_text(
+        "📥 فایل‌های من\n\nیکی از گزینه‌ها را انتخاب کنید:",
+        reply_markup=my_files_keyboard()
+    )
+
+
+# =========================================================
+# ADMIN FILE DELETE
+# =========================================================
+
+async def delete_file_start(update, context):
+    if not is_admin(update):
+        return
+
+    rows = query(
+        """
+        SELECT
+            bf.id,
+            bf.added_at,
+            b.title AS button_title
+        FROM button_files bf
+        JOIN buttons b ON b.id = bf.button_id
+        ORDER BY bf.added_at DESC, bf.id DESC
+        LIMIT 50
+        """,
+        fetch=True
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "❌ هیچ فایلی ثبت نشده است.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    keyboard = []
+    for row in rows:
+        title = row["button_title"] or "بدون عنوان"
+        keyboard.append([
+            KeyboardButton(f"🗑 {row['id']} | {title}")
+        ])
+
+    keyboard.append([KeyboardButton("🔙 لغو / بازگشت")])
+
+    set_state(
+        context,
+        "delete_file_choose",
+        admin_section="main"
+    )
+
+    await update.message.reply_text(
+        "🗑 فایل موردنظر را برای حذف انتخاب کن:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
     )
 
 
@@ -634,6 +923,28 @@ async def add_file_to_button(
             source_chat_id,
             source_message_id
         )
+    )
+
+
+# =========================================================
+# FILE PERIOD KEYBOARD
+# =========================================================
+
+def file_period_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("📅 امروز"),
+                KeyboardButton("📆 این هفته")
+            ],
+            [
+                KeyboardButton("📁 عادی"),
+            ],
+            [
+                KeyboardButton("🔙 لغو / بازگشت")
+            ]
+        ],
+        resize_keyboard=True
     )
 
 
@@ -1554,32 +1865,76 @@ async def handle_admin_state(update, context):
 
     if state == "add_file":
 
+        context.user_data["pending_chat_id"] = message.chat_id
+        context.user_data["pending_message_id"] = message.message_id
+        context.user_data["state"] = "add_file_period"
+
+        await message.reply_text(
+            "📅 این فایل مربوط به کدام بخش است؟\n\n"
+            "📅 امروز\n"
+            "📆 این هفته\n"
+            "📁 عادی",
+            reply_markup=file_period_keyboard()
+        )
+
+        return True
+
+    # =====================================================
+    # ADD FIRST FILE - SELECT PERIOD
+    # =====================================================
+
+    if state == "add_file_period":
+
+        period_map = {
+            "📅 امروز": "today",
+            "📆 این هفته": "week",
+            "📁 عادی": "normal"
+        }
+
+        period = period_map.get(text)
+        if not period:
+            await message.reply_text(
+                "یکی از گزینه‌های تاریخ را انتخاب کن.",
+                reply_markup=file_period_keyboard()
+            )
+            return True
+
         button_id = await create_button(
             title=context.user_data["title"],
             kind="file",
-            parent_id=context.user_data.get(
-                "parent_id"
-            ),
-            source_chat_id=message.chat_id,
-            source_message_id=message.message_id
+            parent_id=context.user_data.get("parent_id"),
+            source_chat_id=context.user_data["pending_chat_id"],
+            source_message_id=context.user_data["pending_message_id"]
         )
 
         await add_file_to_button(
             button_id=button_id,
-            source_chat_id=message.chat_id,
-            source_message_id=message.message_id
+            source_chat_id=context.user_data["pending_chat_id"],
+            source_message_id=context.user_data["pending_message_id"]
+        )
+
+        query(
+            """
+            UPDATE button_files
+            SET period = %s
+            WHERE button_id = %s
+              AND source_chat_id = %s
+              AND source_message_id = %s
+            """,
+            (
+                period,
+                button_id,
+                context.user_data["pending_chat_id"],
+                context.user_data["pending_message_id"]
+            )
         )
 
         context.user_data.clear()
 
         await message.reply_text(
-            "✅ دکمه فایل ساخته شد.\n\n"
-            "📁 اولین فایل/پیام ثبت شد.\n"
-            "➕ هر تعداد فایل دیگری خواستی می‌توانی "
-            "بعداً به همین دکمه اضافه کنی.",
+            "✅ دکمه فایل ساخته شد و فایل ثبت شد.",
             reply_markup=admin_keyboard()
         )
-
         return True
 
     # =====================================================
@@ -1614,20 +1969,46 @@ async def handle_admin_state(update, context):
             row["id"]
         )
 
-        context.user_data["state"] = (
-            "change_file"
-        )
+        context.user_data["state"] = "change_file_period"
 
         await message.reply_text(
-            "📁 حالا فایل یا پیام جدید را بفرست.\n\n"
-            "✅ فایل جدید به فایل‌های قبلی اضافه می‌شود.\n"
-            "❌ هیچ فایل قبلی حذف یا جایگزین نمی‌شود.\n\n"
-            "📌 می‌توانی چند فایل را با هم انتخاب و ارسال کنی.\n"
-            "همه فایل‌ها به همین دکمه اضافه خواهند شد.\n\n"
-            "🔙 وقتی تمام شد، «لغو / بازگشت» را بزن.",
-            reply_markup=back_keyboard()
+            "📅 نوع انتشار فایل‌های جدید را انتخاب کن.\n\n"
+            "بعد از انتخاب، هر تعداد فایل که بفرستی به همین دکمه اضافه می‌شود.",
+            reply_markup=file_period_keyboard()
         )
 
+        return True
+
+    # =====================================================
+    # CHANGE FILE - SELECT PERIOD
+    # =====================================================
+
+    if state == "change_file_period":
+
+        period_map = {
+            "📅 امروز": "today",
+            "📆 این هفته": "week",
+            "📁 عادی": "normal"
+        }
+
+        period = period_map.get(text)
+        if not period:
+            await message.reply_text(
+                "یکی از گزینه‌های تاریخ را انتخاب کن.",
+                reply_markup=file_period_keyboard()
+            )
+            return True
+
+        context.user_data["file_period"] = period
+        context.user_data["state"] = "change_file"
+
+        await message.reply_text(
+            "📁 حالا فایل‌ها را بفرست.\n\n"
+            "✅ فایل‌های قبلی حذف نمی‌شوند.\n"
+            "➕ هر فایل جدید به همین دکمه اضافه می‌شود.\n\n"
+            "🔙 وقتی تمام شد «لغو / بازگشت» را بزن.",
+            reply_markup=back_keyboard()
+        )
         return True
 
     # =====================================================
@@ -1659,6 +2040,22 @@ async def handle_admin_state(update, context):
             button_id=button_id,
             source_chat_id=message.chat_id,
             source_message_id=message.message_id
+        )
+
+        query(
+            """
+            UPDATE button_files
+            SET period = %s
+            WHERE button_id = %s
+              AND source_chat_id = %s
+              AND source_message_id = %s
+            """,
+            (
+                context.user_data.get("file_period", "normal"),
+                button_id,
+                message.chat_id,
+                message.message_id
+            )
         )
 
         # -------------------------------------------------
@@ -1830,12 +2227,26 @@ async def handle_admin_state(update, context):
 
         failed = len(results) - success
 
+        channel_result = ""
+        if CHANNEL_ID:
+            try:
+                await context.bot.copy_message(
+                    chat_id=int(CHANNEL_ID),
+                    from_chat_id=message.chat_id,
+                    message_id=message.message_id
+                )
+                channel_result = "\n📣 کانال: ✅ ارسال شد"
+            except Exception as e:
+                logger.warning("Channel broadcast failed: %s", e)
+                channel_result = "\n📣 کانال: ❌ ارسال نشد"
+
         context.user_data.clear()
 
         await message.reply_text(
             "📢 ارسال همگانی تمام شد.\n\n"
             f"✅ موفق: {success}\n"
-            f"❌ ناموفق: {failed}",
+            f"❌ ناموفق: {failed}"
+            f"{channel_result}",
             reply_markup=admin_keyboard()
         )
 
@@ -1960,6 +2371,63 @@ async def handle_admin_state(update, context):
             reply_markup=button_management_keyboard()
         )
 
+        return True
+
+    # =====================================================
+    # DELETE FILE
+    # =====================================================
+
+    if state == "delete_file_choose":
+
+        if not text.startswith("🗑 "):
+            await message.reply_text(
+                "❌ فایل معتبر را انتخاب کن."
+            )
+            return True
+
+        try:
+            file_id = int(text.split("|", 1)[0].replace("🗑", "").strip())
+        except Exception:
+            await message.reply_text("❌ شناسه فایل نامعتبر است.")
+            return True
+
+        row = query(
+            """
+            SELECT id
+            FROM button_files
+            WHERE id = %s
+            """,
+            (file_id,),
+            fetch=True,
+            one=True
+        )
+
+        if not row:
+            await message.reply_text("❌ فایل پیدا نشد.")
+            return True
+
+        query(
+            """
+            DELETE FROM user_file_downloads
+            WHERE file_id = %s
+            """,
+            (file_id,)
+        )
+
+        query(
+            """
+            DELETE FROM button_files
+            WHERE id = %s
+            """,
+            (file_id,)
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ فایل با موفقیت حذف شد.",
+            reply_markup=admin_keyboard()
+        )
         return True
 
     # =====================================================
@@ -2178,6 +2646,15 @@ async def admin_text_router(update, context):
 
         return True
 
+    if text == "🗑 حذف فایل":
+
+        await delete_file_start(
+            update,
+            context
+        )
+
+        return True
+
     if text == "👤 منوی کاربر":
 
         await show_root(
@@ -2343,6 +2820,38 @@ async def user_router(update, context):
         return
 
     # =====================================================
+    # FIXED FILE SHORTCUTS
+    # =====================================================
+
+    if text == "🆕 تازه‌ترین فایل‌ها":
+        await show_file_section(update, context, "latest")
+        return
+
+    if text == "📅 فایل‌های امروز":
+        await show_file_section(update, context, "today")
+        return
+
+    if text == "📆 فایل‌های این هفته":
+        await show_file_section(update, context, "week")
+        return
+
+    if text == "📥 فایل‌های من":
+        await show_my_files_menu(update, context)
+        return
+
+    if text == "🆕 فایل‌های جدید":
+        await show_file_section(update, context, "mine")
+        return
+
+    if text == "📥 دانلود همه فایل‌ها":
+        await show_file_section(update, context, "all")
+        return
+
+    if text == "✅ فایل‌های دریافت‌شده":
+        await show_file_section(update, context, "received")
+        return
+
+    # =====================================================
     # FIND BUTTON
     # =====================================================
 
@@ -2415,28 +2924,6 @@ async def user_router(update, context):
             fetch=True
         )
 
-        # -------------------------------------------------
-        # Fallback for old data
-        # -------------------------------------------------
-
-        if not files:
-
-            if (
-                button["source_chat_id"] is not None
-                and
-                button["source_message_id"] is not None
-            ):
-
-                files = [
-                    {
-                        "source_chat_id":
-                            button["source_chat_id"],
-
-                        "source_message_id":
-                            button["source_message_id"]
-                    }
-                ]
-
         if not files:
 
             await update.message.reply_text(
@@ -2467,6 +2954,30 @@ async def user_router(update, context):
                 )
 
                 success += 1
+                if update.effective_user:
+                    # Find the database file row and remember this user received it.
+                    db_file = query(
+                        """
+                        SELECT id
+                        FROM button_files
+                        WHERE button_id = %s
+                          AND source_chat_id = %s
+                          AND source_message_id = %s
+                        LIMIT 1
+                        """,
+                        (
+                            button["id"],
+                            file["source_chat_id"],
+                            file["source_message_id"]
+                        ),
+                        fetch=True,
+                        one=True
+                    )
+                    if db_file:
+                        mark_file_downloaded(
+                            update.effective_user.id,
+                            db_file["id"]
+                        )
 
             except Exception as e:
 
