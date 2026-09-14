@@ -6,6 +6,7 @@ import html
 from aiohttp import web
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -38,24 +39,59 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# =========================================================
+# FAST CACHE
+# =========================================================
+
+ADMIN_CACHE = {ADMIN_ID}
+USER_CACHE = set()
+START_TEXT_CACHE = None
+
+db_pool = None
+
 
 # =========================================================
-# DATABASE
+# DATABASE POOL
 # =========================================================
 
-def db():
-    return psycopg.connect(
-        DATABASE_URL,
-        row_factory=dict_row
-    )
+def init_db_pool():
+
+    global db_pool
+
+    if db_pool is None:
+
+        db_pool = ConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            kwargs={
+                "row_factory": dict_row
+            }
+        )
+
+        db_pool.wait()
+
+        logger.info("PostgreSQL connection pool ready")
 
 
 def query(sql, params=(), fetch=False, one=False):
-    with db() as connection:
+
+    global db_pool
+
+    if db_pool is None:
+        init_db_pool()
+
+    with db_pool.connection() as connection:
+
         with connection.cursor() as cursor:
-            cursor.execute(sql, params)
+
+            cursor.execute(
+                sql,
+                params
+            )
 
             if fetch:
+
                 rows = cursor.fetchall()
 
                 if one:
@@ -83,7 +119,6 @@ def init_admin_table():
         """
     )
 
-    # ثبت ادمین اصلی
     query(
         """
         INSERT INTO admins (user_id)
@@ -93,54 +128,51 @@ def init_admin_table():
         (ADMIN_ID,)
     )
 
+    # Load all admins into RAM
+    admins = query(
+        """
+        SELECT user_id
+        FROM admins
+        """,
+        fetch=True
+    )
+
+    ADMIN_CACHE.clear()
+    ADMIN_CACHE.add(ADMIN_ID)
+
+    for admin in admins:
+        ADMIN_CACHE.add(
+            admin["user_id"]
+        )
+
+    logger.info(
+        "Loaded %s admins",
+        len(ADMIN_CACHE)
+    )
+
 
 # =========================================================
-# ADMIN CHECK
+# ADMIN CHECK - FAST
 # =========================================================
 
 def is_main_admin(update):
 
+    user = update.effective_user
+
     return (
-        update.effective_user is not None
-        and update.effective_user.id == ADMIN_ID
+        user is not None
+        and user.id == ADMIN_ID
     )
 
 
 def is_admin(update):
 
-    if not update.effective_user:
+    user = update.effective_user
+
+    if not user:
         return False
 
-    user_id = update.effective_user.id
-
-    # ادمین اصلی
-    if user_id == ADMIN_ID:
-        return True
-
-    # ادمین‌های اضافه‌شده
-    try:
-
-        row = query(
-            """
-            SELECT user_id
-            FROM admins
-            WHERE user_id = %s
-            """,
-            (user_id,),
-            fetch=True,
-            one=True
-        )
-
-        return row is not None
-
-    except Exception as e:
-
-        logger.error(
-            "Admin check error: %s",
-            e
-        )
-
-        return False
+    return user.id in ADMIN_CACHE
 
 
 # =========================================================
@@ -222,14 +254,21 @@ def user_keyboard(parent_id=None, page=0):
     per_page = 8
 
     start = page * per_page
-    current = buttons[start:start + per_page]
+
+    current = buttons[
+        start:start + per_page
+    ]
 
     keyboard = []
 
     for button in current:
 
         keyboard.append(
-            [KeyboardButton(button["title"])]
+            [
+                KeyboardButton(
+                    button["title"]
+                )
+            ]
         )
 
     navigation = []
@@ -237,13 +276,17 @@ def user_keyboard(parent_id=None, page=0):
     if page > 0:
 
         navigation.append(
-            KeyboardButton("⬅️ صفحه قبل")
+            KeyboardButton(
+                "⬅️ صفحه قبل"
+            )
         )
 
     if start + per_page < len(buttons):
 
         navigation.append(
-            KeyboardButton("➡️ صفحه بعد")
+            KeyboardButton(
+                "➡️ صفحه بعد"
+            )
         )
 
     if navigation:
@@ -253,7 +296,11 @@ def user_keyboard(parent_id=None, page=0):
     if parent_id is not None:
 
         keyboard.append(
-            [KeyboardButton("🔙 بازگشت")]
+            [
+                KeyboardButton(
+                    "🔙 بازگشت"
+                )
+            ]
         )
 
     return (
@@ -267,10 +314,12 @@ def user_keyboard(parent_id=None, page=0):
 
 
 # =========================================================
-# START TEXT
+# START TEXT CACHE
 # =========================================================
 
-def get_start_text():
+def load_start_text():
+
+    global START_TEXT_CACHE
 
     row = query(
         """
@@ -284,9 +333,24 @@ def get_start_text():
 
     if row:
 
-        return row["value"]
+        START_TEXT_CACHE = row["value"]
 
-    return "سلام 👋 به ربات ما خوش آمدید!"
+    else:
+
+        START_TEXT_CACHE = (
+            "سلام 👋 به ربات ما خوش آمدید!"
+        )
+
+
+def get_start_text():
+
+    global START_TEXT_CACHE
+
+    if START_TEXT_CACHE is None:
+
+        load_start_text()
+
+    return START_TEXT_CACHE
 
 
 # =========================================================
@@ -305,7 +369,7 @@ def set_state(context, state, **data):
 
 
 # =========================================================
-# SAVE USER
+# SAVE USER - FAST CACHE
 # =========================================================
 
 async def save_user(update):
@@ -315,28 +379,46 @@ async def save_user(update):
     if not user:
         return
 
-    query(
-        """
-        INSERT INTO users
-        (
-            user_id,
-            first_name,
-            username
-        )
-        VALUES
-        (%s, %s, %s)
+    user_id = user.id
 
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-            first_name = EXCLUDED.first_name,
-            username = EXCLUDED.username
-        """,
-        (
-            user.id,
-            user.first_name or "",
-            user.username or ""
+    # اگر قبلاً در این اجرای ربات ثبت شده
+    # دیگر برای هر پیام دیتابیس را درگیر نمی‌کنیم
+    if user_id in USER_CACHE:
+        return
+
+    try:
+
+        query(
+            """
+            INSERT INTO users
+            (
+                user_id,
+                first_name,
+                username
+            )
+            VALUES
+            (%s, %s, %s)
+
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                first_name = EXCLUDED.first_name,
+                username = EXCLUDED.username
+            """,
+            (
+                user_id,
+                user.first_name or "",
+                user.username or ""
+            )
         )
-    )
+
+        USER_CACHE.add(user_id)
+
+    except Exception as e:
+
+        logger.error(
+            "Save user error: %s",
+            e
+        )
 
 
 # =========================================================
@@ -412,7 +494,9 @@ async def create_button(
         one=True
     )
 
-    sort_order = result["max_sort"] + 1
+    sort_order = (
+        result["max_sort"] + 1
+    )
 
     query(
         """
@@ -521,11 +605,19 @@ async def add_child_start(update, context):
     for menu in menus:
 
         keyboard.append(
-            [KeyboardButton(menu["title"])]
+            [
+                KeyboardButton(
+                    menu["title"]
+                )
+            ]
         )
 
     keyboard.append(
-        [KeyboardButton("🔙 لغو / بازگشت")]
+        [
+            KeyboardButton(
+                "🔙 لغو / بازگشت"
+            )
+        ]
     )
 
     set_state(
@@ -572,7 +664,7 @@ async def management_menu(update, context):
 
 
 # =========================================================
-# RENAME BUTTON
+# RENAME
 # =========================================================
 
 async def rename_start(update, context):
@@ -596,12 +688,20 @@ async def rename_start(update, context):
         return
 
     keyboard = [
-        [KeyboardButton(button["title"])]
+        [
+            KeyboardButton(
+                button["title"]
+            )
+        ]
         for button in buttons
     ]
 
     keyboard.append(
-        [KeyboardButton("🔙 لغو / بازگشت")]
+        [
+            KeyboardButton(
+                "🔙 لغو / بازگشت"
+            )
+        ]
     )
 
     set_state(
@@ -619,7 +719,7 @@ async def rename_start(update, context):
 
 
 # =========================================================
-# DELETE BUTTON
+# DELETE
 # =========================================================
 
 async def delete_start(update, context):
@@ -643,12 +743,20 @@ async def delete_start(update, context):
         return
 
     keyboard = [
-        [KeyboardButton(button["title"])]
+        [
+            KeyboardButton(
+                button["title"]
+            )
+        ]
         for button in buttons
     ]
 
     keyboard.append(
-        [KeyboardButton("🔙 لغو / بازگشت")]
+        [
+            KeyboardButton(
+                "🔙 لغو / بازگشت"
+            )
+        ]
     )
 
     set_state(
@@ -760,8 +868,7 @@ async def add_admin_start(update, context):
     await update.message.reply_text(
         "➕ آیدی عددی کاربر را بفرست.\n\n"
         "مثال:\n"
-        "123456789\n\n"
-        "آیدی عددی را دقیق وارد کن.",
+        "123456789",
         reply_markup=back_keyboard()
     )
 
@@ -796,19 +903,22 @@ async def remove_admin_start(update, context):
         user_id = admin["user_id"]
 
         if user_id == ADMIN_ID:
-
             title = f"👑 {user_id} (ادمین اصلی)"
-
         else:
-
             title = f"👤 {user_id}"
 
         keyboard.append(
-            [KeyboardButton(title)]
+            [
+                KeyboardButton(title)
+            ]
         )
 
     keyboard.append(
-        [KeyboardButton("🔙 لغو / بازگشت")]
+        [
+            KeyboardButton(
+                "🔙 لغو / بازگشت"
+            )
+        ]
     )
 
     set_state(
@@ -850,7 +960,10 @@ async def admin_list(update, context):
 
     text = "👥 لیست ادمین‌ها:\n\n"
 
-    for index, admin in enumerate(admins, 1):
+    for index, admin in enumerate(
+        admins,
+        1
+    ):
 
         user_id = admin["user_id"]
 
@@ -873,7 +986,7 @@ async def admin_list(update, context):
 
 
 # =========================================================
-# ADMIN STATE HANDLER
+# ADMIN STATE
 # =========================================================
 
 async def handle_admin_state(update, context):
@@ -888,7 +1001,9 @@ async def handle_admin_state(update, context):
 
     text = message.text or ""
 
-    state = context.user_data.get("state")
+    state = context.user_data.get(
+        "state"
+    )
 
     # =====================================================
     # CANCEL
@@ -922,18 +1037,16 @@ async def handle_admin_state(update, context):
 
             return True
 
-        value = text.strip()
-
         try:
 
-            new_admin_id = int(value)
+            new_admin_id = int(
+                text.strip()
+            )
 
         except ValueError:
 
             await message.reply_text(
-                "❌ آیدی باید فقط عدد باشد.\n\n"
-                "مثال:\n"
-                "123456789"
+                "❌ آیدی باید فقط عدد باشد."
             )
 
             return True
@@ -946,18 +1059,7 @@ async def handle_admin_state(update, context):
 
             return True
 
-        existing = query(
-            """
-            SELECT user_id
-            FROM admins
-            WHERE user_id = %s
-            """,
-            (new_admin_id,),
-            fetch=True,
-            one=True
-        )
-
-        if existing:
+        if new_admin_id in ADMIN_CACHE:
 
             context.user_data.clear()
 
@@ -975,6 +1077,10 @@ async def handle_admin_state(update, context):
             ON CONFLICT (user_id) DO NOTHING
             """,
             (new_admin_id,)
+        )
+
+        ADMIN_CACHE.add(
+            new_admin_id
         )
 
         context.user_data.clear()
@@ -1005,23 +1111,27 @@ async def handle_admin_state(update, context):
 
             return True
 
-        value = text.strip()
-
         try:
 
-            if value.startswith("👑"):
+            if text.startswith("👑"):
 
                 admin_id = int(
-                    value.split("👑", 1)[1]
-                    .split("(", 1)[0]
-                    .strip()
+                    text.split(
+                        "👑",
+                        1
+                    )[1].split(
+                        "(",
+                        1
+                    )[0].strip()
                 )
 
-            elif value.startswith("👤"):
+            elif text.startswith("👤"):
 
                 admin_id = int(
-                    value.split("👤", 1)[1]
-                    .strip()
+                    text.split(
+                        "👤",
+                        1
+                    )[1].strip()
                 )
 
             else:
@@ -1036,7 +1146,6 @@ async def handle_admin_state(update, context):
 
             return True
 
-        # جلوگیری از حذف ادمین اصلی
         if admin_id == ADMIN_ID:
 
             context.user_data.clear()
@@ -1054,6 +1163,10 @@ async def handle_admin_state(update, context):
             WHERE user_id = %s
             """,
             (admin_id,)
+        )
+
+        ADMIN_CACHE.discard(
+            admin_id
         )
 
         context.user_data.clear()
@@ -1080,9 +1193,13 @@ async def handle_admin_state(update, context):
 
             return True
 
-        context.user_data["title"] = text.strip()
+        context.user_data["title"] = (
+            text.strip()
+        )
 
-        context.user_data["state"] = "add_kind"
+        context.user_data["state"] = (
+            "add_kind"
+        )
 
         await ask_button_type(
             update,
@@ -1097,7 +1214,9 @@ async def handle_admin_state(update, context):
 
     if state == "add_kind":
 
-        title = context.user_data["title"]
+        title = context.user_data[
+            "title"
+        ]
 
         parent_id = context.user_data.get(
             "parent_id"
@@ -1122,7 +1241,9 @@ async def handle_admin_state(update, context):
 
         if text == "📁 فایل / پیام":
 
-            context.user_data["state"] = "add_file"
+            context.user_data["state"] = (
+                "add_file"
+            )
 
             await message.reply_text(
                 "📁 حالا فایل یا پیام را بفرست.\n\n"
@@ -1135,7 +1256,9 @@ async def handle_admin_state(update, context):
 
         if text == "📝 متن":
 
-            context.user_data["state"] = "add_text"
+            context.user_data["state"] = (
+                "add_text"
+            )
 
             await message.reply_text(
                 "📝 متن این دکمه را بفرست:",
@@ -1146,7 +1269,9 @@ async def handle_admin_state(update, context):
 
         if text == "🔗 لینک":
 
-            context.user_data["state"] = "add_link"
+            context.user_data["state"] = (
+                "add_link"
+            )
 
             await message.reply_text(
                 "🔗 آدرس لینک را بفرست:\n"
@@ -1163,7 +1288,7 @@ async def handle_admin_state(update, context):
         return True
 
     # =====================================================
-    # FILE / MESSAGE
+    # FILE
     # =====================================================
 
     if state == "add_file":
@@ -1171,7 +1296,9 @@ async def handle_admin_state(update, context):
         await create_button(
             title=context.user_data["title"],
             kind="file",
-            parent_id=context.user_data.get("parent_id"),
+            parent_id=context.user_data.get(
+                "parent_id"
+            ),
             source_chat_id=message.chat_id,
             source_message_id=message.message_id
         )
@@ -1186,7 +1313,7 @@ async def handle_admin_state(update, context):
         return True
 
     # =====================================================
-    # TEXT BUTTON
+    # TEXT
     # =====================================================
 
     if state == "add_text":
@@ -1194,7 +1321,9 @@ async def handle_admin_state(update, context):
         await create_button(
             title=context.user_data["title"],
             kind="text",
-            parent_id=context.user_data.get("parent_id"),
+            parent_id=context.user_data.get(
+                "parent_id"
+            ),
             value=message.text or ""
         )
 
@@ -1208,12 +1337,14 @@ async def handle_admin_state(update, context):
         return True
 
     # =====================================================
-    # LINK BUTTON
+    # LINK
     # =====================================================
 
     if state == "add_link":
 
-        value = (message.text or "").strip()
+        value = (
+            message.text or ""
+        ).strip()
 
         if not (
             value.startswith("https://")
@@ -1229,7 +1360,9 @@ async def handle_admin_state(update, context):
         await create_button(
             title=context.user_data["title"],
             kind="link",
-            parent_id=context.user_data.get("parent_id"),
+            parent_id=context.user_data.get(
+                "parent_id"
+            ),
             value=value
         )
 
@@ -1248,7 +1381,11 @@ async def handle_admin_state(update, context):
 
     if state == "start_text":
 
-        value = (message.text or "").strip()
+        global START_TEXT_CACHE
+
+        value = (
+            message.text or ""
+        ).strip()
 
         if not value:
 
@@ -1262,12 +1399,13 @@ async def handle_admin_state(update, context):
             """
             INSERT INTO settings(key, value)
             VALUES('start_text', %s)
-
             ON CONFLICT(key)
             DO UPDATE SET value = EXCLUDED.value
             """,
             (value,)
         )
+
+        START_TEXT_CACHE = value
 
         context.user_data.clear()
 
@@ -1285,30 +1423,56 @@ async def handle_admin_state(update, context):
     if state == "broadcast":
 
         users = query(
-            "SELECT user_id FROM users",
+            """
+            SELECT user_id
+            FROM users
+            """,
             fetch=True
         )
 
         success = 0
         failed = 0
 
-        for user in users:
+        # همزمانی کنترل‌شده
+        semaphore = asyncio.Semaphore(10)
 
-            try:
+        async def send_to_user(user):
 
-                await context.bot.copy_message(
-                    chat_id=user["user_id"],
-                    from_chat_id=message.chat_id,
-                    message_id=message.message_id
-                )
+            async with semaphore:
 
-                success += 1
+                try:
 
-                await asyncio.sleep(0.05)
+                    await context.bot.copy_message(
+                        chat_id=user["user_id"],
+                        from_chat_id=message.chat_id,
+                        message_id=message.message_id
+                    )
 
-            except Exception:
+                    return True
 
-                failed += 1
+                except Exception as e:
+
+                    logger.warning(
+                        "Broadcast failed for %s: %s",
+                        user["user_id"],
+                        e
+                    )
+
+                    return False
+
+        results = await asyncio.gather(
+            *[
+                send_to_user(user)
+                for user in users
+            ]
+        )
+
+        success = sum(
+            1 for result in results
+            if result
+        )
+
+        failed = len(results) - success
 
         context.user_data.clear()
 
@@ -1389,9 +1553,13 @@ async def handle_admin_state(update, context):
 
             return True
 
-        context.user_data["button_id"] = row["id"]
+        context.user_data["button_id"] = (
+            row["id"]
+        )
 
-        context.user_data["state"] = "rename_new"
+        context.user_data["state"] = (
+            "rename_new"
+        )
 
         await message.reply_text(
             "✏️ نام جدید را بفرست:",
@@ -1485,7 +1653,7 @@ async def handle_admin_state(update, context):
 
 
 # =========================================================
-# ADMIN TEXT ROUTER
+# ADMIN ROUTER
 # =========================================================
 
 async def admin_text_router(update, context):
@@ -1493,7 +1661,9 @@ async def admin_text_router(update, context):
     if not is_admin(update):
         return False
 
-    state = context.user_data.get("state")
+    state = context.user_data.get(
+        "state"
+    )
 
     if state:
 
@@ -1506,10 +1676,6 @@ async def admin_text_router(update, context):
             return True
 
     text = update.message.text or ""
-
-    # =====================================================
-    # ADMIN MANAGEMENT
-    # =====================================================
 
     if text == "👥 مدیریت ادمین‌ها":
 
@@ -1546,10 +1712,6 @@ async def admin_text_router(update, context):
         )
 
         return True
-
-    # =====================================================
-    # BUTTON MANAGEMENT
-    # =====================================================
 
     if text == "➕ افزودن دکمه":
 
@@ -1644,7 +1806,7 @@ async def admin_text_router(update, context):
 
 
 # =========================================================
-# USER BUTTONS
+# USER ROUTER
 # =========================================================
 
 async def user_router(update, context):
@@ -1731,7 +1893,6 @@ async def user_router(update, context):
         )
 
         if page > max_page:
-
             page = max_page
 
         context.user_data["menu_page"] = page
@@ -1782,7 +1943,9 @@ async def user_router(update, context):
 
     if button["kind"] == "menu":
 
-        context.user_data["menu_parent"] = button["id"]
+        context.user_data["menu_parent"] = (
+            button["id"]
+        )
 
         context.user_data["menu_page"] = 0
 
@@ -1799,7 +1962,7 @@ async def user_router(update, context):
         return
 
     # =====================================================
-    # FILE / MESSAGE
+    # FILE
     # =====================================================
 
     if button["kind"] == "file":
@@ -1808,8 +1971,12 @@ async def user_router(update, context):
 
             await context.bot.copy_message(
                 chat_id=update.effective_chat.id,
-                from_chat_id=button["source_chat_id"],
-                message_id=button["source_message_id"]
+                from_chat_id=button[
+                    "source_chat_id"
+                ],
+                message_id=button[
+                    "source_message_id"
+                ]
             )
 
         except Exception:
@@ -1838,10 +2005,8 @@ async def user_router(update, context):
 
     if button["kind"] == "link":
 
-        url = button["value"] or ""
-
         await update.message.reply_text(
-            url
+            button["value"] or ""
         )
 
         return
@@ -1894,13 +2059,19 @@ async def error_handler(update, context):
 
 
 # =========================================================
-# WEBHOOK SERVER
+# WEBHOOK
 # =========================================================
 
 async def main():
 
-    # ساخت جدول ادمین‌ها
+    # PostgreSQL pool
+    init_db_pool()
+
+    # Admins
     init_admin_table()
+
+    # Start text
+    load_start_text()
 
     if not PUBLIC_URL:
 
@@ -1913,6 +2084,7 @@ async def main():
         .builder()
         .token(TOKEN)
         .updater(None)
+        .concurrent_updates(True)
         .build()
     )
 
@@ -2016,7 +2188,7 @@ async def main():
     await site.start()
 
     logger.info(
-        "Bot started on port %s",
+        "FAST BOT STARTED ON PORT %s",
         PORT
     )
 
@@ -2033,6 +2205,12 @@ async def main():
         await application.stop()
 
         await application.shutdown()
+
+        if db_pool:
+
+            db_pool.close()
+
+            db_pool.wait_closed()
 
 
 # =========================================================
