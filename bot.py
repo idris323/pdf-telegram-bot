@@ -128,7 +128,6 @@ def init_admin_table():
         (ADMIN_ID,)
     )
 
-    # Load all admins into RAM
     admins = query(
         """
         SELECT user_id
@@ -141,6 +140,7 @@ def init_admin_table():
     ADMIN_CACHE.add(ADMIN_ID)
 
     for admin in admins:
+
         ADMIN_CACHE.add(
             admin["user_id"]
         )
@@ -152,7 +152,7 @@ def init_admin_table():
 
 
 # =========================================================
-# ADMIN CHECK - FAST
+# ADMIN CHECK
 # =========================================================
 
 def is_main_admin(update):
@@ -213,6 +213,29 @@ def admin_management_keyboard():
             ],
             [
                 KeyboardButton("👥 لیست ادمین‌ها")
+            ],
+            [
+                KeyboardButton("🔙 لغو / بازگشت")
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+
+def button_management_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("➕ افزودن دکمه اصلی"),
+                KeyboardButton("➕ افزودن زیرمنو")
+            ],
+            [
+                KeyboardButton("✏️ تغییر نام"),
+                KeyboardButton("📁 تغییر فایل / پیام")
+            ],
+            [
+                KeyboardButton("🗑 حذف دکمه")
             ],
             [
                 KeyboardButton("🔙 لغو / بازگشت")
@@ -369,7 +392,7 @@ def set_state(context, state, **data):
 
 
 # =========================================================
-# SAVE USER - FAST CACHE
+# SAVE USER
 # =========================================================
 
 async def save_user(update):
@@ -381,8 +404,6 @@ async def save_user(update):
 
     user_id = user.id
 
-    # اگر قبلاً در این اجرای ربات ثبت شده
-    # دیگر برای هر پیام دیتابیس را درگیر نمی‌کنیم
     if user_id in USER_CACHE:
         return
 
@@ -537,7 +558,8 @@ async def add_button_start(update, context):
     set_state(
         context,
         "add_name",
-        parent_id=None
+        parent_id=None,
+        admin_section="button_management"
     )
 
     await update.message.reply_text(
@@ -595,7 +617,7 @@ async def add_child_start(update, context):
 
         await update.message.reply_text(
             "❌ هنوز هیچ منوی فرعی ساخته نشده است.",
-            reply_markup=admin_keyboard()
+            reply_markup=button_management_keyboard()
         )
 
         return
@@ -622,7 +644,8 @@ async def add_child_start(update, context):
 
     set_state(
         context,
-        "child_parent"
+        "child_parent",
+        admin_section="button_management"
     )
 
     await update.message.reply_text(
@@ -640,26 +663,15 @@ async def add_child_start(update, context):
 
 async def management_menu(update, context):
 
-    keyboard = ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("➕ افزودن دکمه اصلی"),
-                KeyboardButton("➕ افزودن زیرمنو")
-            ],
-            [
-                KeyboardButton("✏️ تغییر نام"),
-                KeyboardButton("🗑 حذف دکمه")
-            ],
-            [
-                KeyboardButton("🔙 لغو / بازگشت")
-            ]
-        ],
-        resize_keyboard=True
+    context.user_data.clear()
+
+    context.user_data["admin_section"] = (
+        "button_management"
     )
 
     await update.message.reply_text(
         "🛠 مدیریت دکمه‌ها:",
-        reply_markup=keyboard
+        reply_markup=button_management_keyboard()
     )
 
 
@@ -682,7 +694,7 @@ async def rename_start(update, context):
 
         await update.message.reply_text(
             "❌ هنوز دکمه‌ای ساخته نشده.",
-            reply_markup=admin_keyboard()
+            reply_markup=button_management_keyboard()
         )
 
         return
@@ -706,7 +718,8 @@ async def rename_start(update, context):
 
     set_state(
         context,
-        "rename_choose"
+        "rename_choose",
+        admin_section="button_management"
     )
 
     await update.message.reply_text(
@@ -737,7 +750,7 @@ async def delete_start(update, context):
 
         await update.message.reply_text(
             "❌ هنوز دکمه‌ای ساخته نشده.",
-            reply_markup=admin_keyboard()
+            reply_markup=button_management_keyboard()
         )
 
         return
@@ -761,11 +774,72 @@ async def delete_start(update, context):
 
     set_state(
         context,
-        "delete_choose"
+        "delete_choose",
+        admin_section="button_management"
     )
 
     await update.message.reply_text(
         "🗑 دکمه‌ای که می‌خواهی حذف کنی انتخاب کن:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
+    )
+
+
+# =========================================================
+# CHANGE FILE / MESSAGE START
+# =========================================================
+
+async def change_file_start(update, context):
+
+    buttons = query(
+        """
+        SELECT id, title
+        FROM buttons
+        WHERE kind = 'file'
+        ORDER BY id
+        """,
+        fetch=True
+    )
+
+    if not buttons:
+
+        await update.message.reply_text(
+            "❌ هنوز هیچ دکمه فایل / پیام ساخته نشده است.",
+            reply_markup=button_management_keyboard()
+        )
+
+        return
+
+    keyboard = []
+
+    for button in buttons:
+
+        keyboard.append(
+            [
+                KeyboardButton(
+                    button["title"]
+                )
+            ]
+        )
+
+    keyboard.append(
+        [
+            KeyboardButton(
+                "🔙 لغو / بازگشت"
+            )
+        ]
+    )
+
+    set_state(
+        context,
+        "change_file_choose",
+        admin_section="button_management"
+    )
+
+    await update.message.reply_text(
+        "📁 دکمه‌ای که می‌خواهی فایل / پیام آن را تغییر بده انتخاب کن:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
             resize_keyboard=True
@@ -781,7 +855,8 @@ async def edit_start_text(update, context):
 
     set_state(
         context,
-        "start_text"
+        "start_text",
+        admin_section="main"
     )
 
     await update.message.reply_text(
@@ -822,7 +897,8 @@ async def broadcast_start(update, context):
 
     set_state(
         context,
-        "broadcast"
+        "broadcast",
+        admin_section="main"
     )
 
     await update.message.reply_text(
@@ -848,6 +924,10 @@ async def admin_management(update, context):
 
     context.user_data.clear()
 
+    context.user_data["admin_section"] = (
+        "admin_management"
+    )
+
     await update.message.reply_text(
         "👥 مدیریت ادمین‌ها\n\n"
         "از گزینه‌های زیر استفاده کن:",
@@ -862,7 +942,8 @@ async def add_admin_start(update, context):
 
     set_state(
         context,
-        "add_admin"
+        "add_admin",
+        admin_section="admin_management"
     )
 
     await update.message.reply_text(
@@ -923,7 +1004,8 @@ async def remove_admin_start(update, context):
 
     set_state(
         context,
-        "remove_admin"
+        "remove_admin",
+        admin_section="admin_management"
     )
 
     await update.message.reply_text(
@@ -1005,18 +1087,47 @@ async def handle_admin_state(update, context):
         "state"
     )
 
+    admin_section = context.user_data.get(
+        "admin_section",
+        "main"
+    )
+
     # =====================================================
-    # CANCEL
+    # CANCEL / BACK
     # =====================================================
 
     if text == "🔙 لغو / بازگشت":
 
         context.user_data.clear()
 
-        await message.reply_text(
-            "⚙️ پنل مدیریت",
-            reply_markup=admin_keyboard()
-        )
+        if admin_section == "button_management":
+
+            context.user_data["admin_section"] = (
+                "button_management"
+            )
+
+            await message.reply_text(
+                "🛠 مدیریت دکمه‌ها:",
+                reply_markup=button_management_keyboard()
+            )
+
+        elif admin_section == "admin_management":
+
+            context.user_data["admin_section"] = (
+                "admin_management"
+            )
+
+            await message.reply_text(
+                "👥 مدیریت ادمین‌ها:",
+                reply_markup=admin_management_keyboard()
+            )
+
+        else:
+
+            await message.reply_text(
+                "⚙️ پنل مدیریت",
+                reply_markup=admin_keyboard()
+            )
 
         return True
 
@@ -1288,7 +1399,7 @@ async def handle_admin_state(update, context):
         return True
 
     # =====================================================
-    # FILE
+    # ADD FILE
     # =====================================================
 
     if state == "add_file":
@@ -1308,6 +1419,96 @@ async def handle_admin_state(update, context):
         await message.reply_text(
             "✅ فایل/پیام با موفقیت ثبت شد.",
             reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # =====================================================
+    # CHANGE FILE - SELECT BUTTON
+    # =====================================================
+
+    if state == "change_file_choose":
+
+        row = query(
+            """
+            SELECT id, title, kind
+            FROM buttons
+            WHERE title = %s
+            AND kind = 'file'
+            ORDER BY id
+            LIMIT 1
+            """,
+            (text,),
+            fetch=True,
+            one=True
+        )
+
+        if not row:
+
+            await message.reply_text(
+                "❌ دکمه فایل پیدا نشد."
+            )
+
+            return True
+
+        context.user_data["button_id"] = (
+            row["id"]
+        )
+
+        context.user_data["state"] = (
+            "change_file"
+        )
+
+        await message.reply_text(
+            "📁 حالا فایل یا پیام جدید را بفرست.\n\n"
+            "فایل قبلی با این فایل/پیام جایگزین می‌شود.",
+            reply_markup=back_keyboard()
+        )
+
+        return True
+
+    # =====================================================
+    # CHANGE FILE - SAVE NEW FILE
+    # =====================================================
+
+    if state == "change_file":
+
+        button_id = context.user_data.get(
+            "button_id"
+        )
+
+        if not button_id:
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "❌ خطا در انتخاب دکمه.",
+                reply_markup=button_management_keyboard()
+            )
+
+            return True
+
+        query(
+            """
+            UPDATE buttons
+            SET
+                source_chat_id = %s,
+                source_message_id = %s
+            WHERE id = %s
+            AND kind = 'file'
+            """,
+            (
+                message.chat_id,
+                message.message_id,
+                button_id
+            )
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ فایل / پیام دکمه با موفقیت تغییر کرد.",
+            reply_markup=button_management_keyboard()
         )
 
         return True
@@ -1430,10 +1631,6 @@ async def handle_admin_state(update, context):
             fetch=True
         )
 
-        success = 0
-        failed = 0
-
-        # همزمانی کنترل‌شده
         semaphore = asyncio.Semaphore(10)
 
         async def send_to_user(user):
@@ -1516,7 +1713,8 @@ async def handle_admin_state(update, context):
         set_state(
             context,
             "add_name",
-            parent_id=row["id"]
+            parent_id=row["id"],
+            admin_section="button_management"
         )
 
         await message.reply_text(
@@ -1600,7 +1798,7 @@ async def handle_admin_state(update, context):
 
         await message.reply_text(
             "✅ نام دکمه تغییر کرد.",
-            reply_markup=admin_keyboard()
+            reply_markup=button_management_keyboard()
         )
 
         return True
@@ -1644,7 +1842,7 @@ async def handle_admin_state(update, context):
 
         await message.reply_text(
             "🗑 دکمه حذف شد.",
-            reply_markup=admin_keyboard()
+            reply_markup=button_management_keyboard()
         )
 
         return True
@@ -1661,9 +1859,64 @@ async def admin_text_router(update, context):
     if not is_admin(update):
         return False
 
+    if not update.message:
+        return False
+
+    text = update.message.text or ""
+
     state = context.user_data.get(
         "state"
     )
+
+    # =====================================================
+    # BACK WITHOUT STATE
+    # =====================================================
+
+    if text == "🔙 لغو / بازگشت" and not state:
+
+        section = context.user_data.get(
+            "admin_section",
+            "main"
+        )
+
+        context.user_data.clear()
+
+        if section == "button_management":
+
+            context.user_data["admin_section"] = (
+                "button_management"
+            )
+
+            await update.message.reply_text(
+                "🛠 مدیریت دکمه‌ها:",
+                reply_markup=button_management_keyboard()
+            )
+
+            return True
+
+        if section == "admin_management":
+
+            context.user_data["admin_section"] = (
+                "admin_management"
+            )
+
+            await update.message.reply_text(
+                "👥 مدیریت ادمین‌ها:",
+                reply_markup=admin_management_keyboard()
+            )
+
+            return True
+
+        await update.message.reply_text(
+            "⚙️ پنل مدیریت",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # =====================================================
+    # STATE
+    # =====================================================
 
     if state:
 
@@ -1675,7 +1928,9 @@ async def admin_text_router(update, context):
         if handled:
             return True
 
-    text = update.message.text or ""
+    # =====================================================
+    # ADMIN MANAGEMENT
+    # =====================================================
 
     if text == "👥 مدیریت ادمین‌ها":
 
@@ -1712,6 +1967,10 @@ async def admin_text_router(update, context):
         )
 
         return True
+
+    # =====================================================
+    # BUTTON MANAGEMENT
+    # =====================================================
 
     if text == "➕ افزودن دکمه":
 
@@ -1766,6 +2025,10 @@ async def admin_text_router(update, context):
 
         return True
 
+    # =====================================================
+    # BUTTON MANAGEMENT ACTIONS
+    # =====================================================
+
     if text == "➕ افزودن دکمه اصلی":
 
         await add_button_start(
@@ -1787,6 +2050,15 @@ async def admin_text_router(update, context):
     if text == "✏️ تغییر نام":
 
         await rename_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "📁 تغییر فایل / پیام":
+
+        await change_file_start(
             update,
             context
         )
@@ -1979,7 +2251,12 @@ async def user_router(update, context):
                 ]
             )
 
-        except Exception:
+        except Exception as e:
+
+            logger.warning(
+                "File copy failed: %s",
+                e
+            )
 
             await update.message.reply_text(
                 "❌ این فایل/پیام دیگر قابل دریافت نیست."
@@ -2027,10 +2304,30 @@ async def all_messages(update, context):
             "state"
         )
 
-        if state in (
-            "add_file",
-            "broadcast"
-        ):
+        # فایل جدید هنگام ساخت
+        if state == "add_file":
+
+            handled = await handle_admin_state(
+                update,
+                context
+            )
+
+            if handled:
+                return
+
+        # فایل جدید هنگام ویرایش
+        if state == "change_file":
+
+            handled = await handle_admin_state(
+                update,
+                context
+            )
+
+            if handled:
+                return
+
+        # Broadcast
+        if state == "broadcast":
 
             handled = await handle_admin_state(
                 update,
@@ -2064,13 +2361,10 @@ async def error_handler(update, context):
 
 async def main():
 
-    # PostgreSQL pool
     init_db_pool()
 
-    # Admins
     init_admin_table()
 
-    # Start text
     load_start_text()
 
     if not PUBLIC_URL:
