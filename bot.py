@@ -69,14 +69,78 @@ def query(sql, params=(), fetch=False, one=False):
 
 
 # =========================================================
+# ADMIN DATABASE
+# =========================================================
+
+def init_admin_table():
+
+    query(
+        """
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id BIGINT PRIMARY KEY,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    # ثبت ادمین اصلی
+    query(
+        """
+        INSERT INTO admins (user_id)
+        VALUES (%s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (ADMIN_ID,)
+    )
+
+
+# =========================================================
 # ADMIN CHECK
 # =========================================================
 
-def is_admin(update):
+def is_main_admin(update):
+
     return (
         update.effective_user is not None
         and update.effective_user.id == ADMIN_ID
     )
+
+
+def is_admin(update):
+
+    if not update.effective_user:
+        return False
+
+    user_id = update.effective_user.id
+
+    # ادمین اصلی
+    if user_id == ADMIN_ID:
+        return True
+
+    # ادمین‌های اضافه‌شده
+    try:
+
+        row = query(
+            """
+            SELECT user_id
+            FROM admins
+            WHERE user_id = %s
+            """,
+            (user_id,),
+            fetch=True,
+            one=True
+        )
+
+        return row is not None
+
+    except Exception as e:
+
+        logger.error(
+            "Admin check error: %s",
+            e
+        )
+
+        return False
 
 
 # =========================================================
@@ -84,6 +148,7 @@ def is_admin(update):
 # =========================================================
 
 def admin_keyboard():
+
     return ReplyKeyboardMarkup(
         [
             [
@@ -96,6 +161,9 @@ def admin_keyboard():
             ],
             [
                 KeyboardButton("📢 ارسال همگانی"),
+                KeyboardButton("👥 مدیریت ادمین‌ها")
+            ],
+            [
                 KeyboardButton("👤 منوی کاربر")
             ],
         ],
@@ -103,10 +171,32 @@ def admin_keyboard():
     )
 
 
-def back_keyboard():
+def admin_management_keyboard():
+
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🔙 لغو / بازگشت")]
+            [
+                KeyboardButton("➕ افزودن ادمین"),
+                KeyboardButton("🗑 حذف ادمین")
+            ],
+            [
+                KeyboardButton("👥 لیست ادمین‌ها")
+            ],
+            [
+                KeyboardButton("🔙 لغو / بازگشت")
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+
+def back_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("🔙 لغو / بازگشت")
+            ]
         ],
         resize_keyboard=True
     )
@@ -137,6 +227,7 @@ def user_keyboard(parent_id=None, page=0):
     keyboard = []
 
     for button in current:
+
         keyboard.append(
             [KeyboardButton(button["title"])]
         )
@@ -144,19 +235,23 @@ def user_keyboard(parent_id=None, page=0):
     navigation = []
 
     if page > 0:
+
         navigation.append(
             KeyboardButton("⬅️ صفحه قبل")
         )
 
     if start + per_page < len(buttons):
+
         navigation.append(
             KeyboardButton("➡️ صفحه بعد")
         )
 
     if navigation:
+
         keyboard.append(navigation)
 
     if parent_id is not None:
+
         keyboard.append(
             [KeyboardButton("🔙 بازگشت")]
         )
@@ -188,6 +283,7 @@ def get_start_text():
     )
 
     if row:
+
         return row["value"]
 
     return "سلام 👋 به ربات ما خوش آمدید!"
@@ -204,6 +300,7 @@ def set_state(context, state, **data):
     context.user_data["state"] = state
 
     for key, value in data.items():
+
         context.user_data[key] = value
 
 
@@ -422,6 +519,7 @@ async def add_child_start(update, context):
     keyboard = []
 
     for menu in menus:
+
         keyboard.append(
             [KeyboardButton(menu["title"])]
         )
@@ -627,6 +725,154 @@ async def broadcast_start(update, context):
 
 
 # =========================================================
+# ADMIN MANAGEMENT
+# =========================================================
+
+async def admin_management(update, context):
+
+    if not is_main_admin(update):
+
+        await update.message.reply_text(
+            "❌ فقط ادمین اصلی می‌تواند ادمین‌ها را مدیریت کند."
+        )
+
+        return
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "👥 مدیریت ادمین‌ها\n\n"
+        "از گزینه‌های زیر استفاده کن:",
+        reply_markup=admin_management_keyboard()
+    )
+
+
+async def add_admin_start(update, context):
+
+    if not is_main_admin(update):
+        return
+
+    set_state(
+        context,
+        "add_admin"
+    )
+
+    await update.message.reply_text(
+        "➕ آیدی عددی کاربر را بفرست.\n\n"
+        "مثال:\n"
+        "123456789\n\n"
+        "آیدی عددی را دقیق وارد کن.",
+        reply_markup=back_keyboard()
+    )
+
+
+async def remove_admin_start(update, context):
+
+    if not is_main_admin(update):
+        return
+
+    admins = query(
+        """
+        SELECT user_id
+        FROM admins
+        ORDER BY added_at
+        """,
+        fetch=True
+    )
+
+    if not admins:
+
+        await update.message.reply_text(
+            "❌ هیچ ادمینی وجود ندارد.",
+            reply_markup=admin_management_keyboard()
+        )
+
+        return
+
+    keyboard = []
+
+    for admin in admins:
+
+        user_id = admin["user_id"]
+
+        if user_id == ADMIN_ID:
+
+            title = f"👑 {user_id} (ادمین اصلی)"
+
+        else:
+
+            title = f"👤 {user_id}"
+
+        keyboard.append(
+            [KeyboardButton(title)]
+        )
+
+    keyboard.append(
+        [KeyboardButton("🔙 لغو / بازگشت")]
+    )
+
+    set_state(
+        context,
+        "remove_admin"
+    )
+
+    await update.message.reply_text(
+        "🗑 ادمینی که می‌خواهی حذف کنی انتخاب کن:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
+    )
+
+
+async def admin_list(update, context):
+
+    if not is_main_admin(update):
+        return
+
+    admins = query(
+        """
+        SELECT user_id, added_at
+        FROM admins
+        ORDER BY added_at
+        """,
+        fetch=True
+    )
+
+    if not admins:
+
+        await update.message.reply_text(
+            "❌ هیچ ادمینی ثبت نشده.",
+            reply_markup=admin_management_keyboard()
+        )
+
+        return
+
+    text = "👥 لیست ادمین‌ها:\n\n"
+
+    for index, admin in enumerate(admins, 1):
+
+        user_id = admin["user_id"]
+
+        if user_id == ADMIN_ID:
+
+            text += (
+                f"{index}. 👑 {user_id} — ادمین اصلی\n"
+            )
+
+        else:
+
+            text += (
+                f"{index}. 👤 {user_id}\n"
+            )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=admin_management_keyboard()
+    )
+
+
+# =========================================================
 # ADMIN STATE HANDLER
 # =========================================================
 
@@ -644,9 +890,9 @@ async def handle_admin_state(update, context):
 
     state = context.user_data.get("state")
 
-    # -----------------------------
+    # =====================================================
     # CANCEL
-    # -----------------------------
+    # =====================================================
 
     if text == "🔙 لغو / بازگشت":
 
@@ -659,9 +905,170 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
+    # ADD ADMIN
+    # =====================================================
+
+    if state == "add_admin":
+
+        if not is_main_admin(update):
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "❌ فقط ادمین اصلی می‌تواند ادمین اضافه کند.",
+                reply_markup=admin_keyboard()
+            )
+
+            return True
+
+        value = text.strip()
+
+        try:
+
+            new_admin_id = int(value)
+
+        except ValueError:
+
+            await message.reply_text(
+                "❌ آیدی باید فقط عدد باشد.\n\n"
+                "مثال:\n"
+                "123456789"
+            )
+
+            return True
+
+        if new_admin_id <= 0:
+
+            await message.reply_text(
+                "❌ آیدی نامعتبر است."
+            )
+
+            return True
+
+        existing = query(
+            """
+            SELECT user_id
+            FROM admins
+            WHERE user_id = %s
+            """,
+            (new_admin_id,),
+            fetch=True,
+            one=True
+        )
+
+        if existing:
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "⚠️ این کاربر قبلاً ادمین است.",
+                reply_markup=admin_management_keyboard()
+            )
+
+            return True
+
+        query(
+            """
+            INSERT INTO admins (user_id)
+            VALUES (%s)
+            ON CONFLICT (user_id) DO NOTHING
+            """,
+            (new_admin_id,)
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ ادمین با موفقیت اضافه شد.\n\n"
+            f"🆔 ID: {new_admin_id}\n\n"
+            "این کاربر اکنون می‌تواند /admin را بزند.",
+            reply_markup=admin_management_keyboard()
+        )
+
+        return True
+
+    # =====================================================
+    # REMOVE ADMIN
+    # =====================================================
+
+    if state == "remove_admin":
+
+        if not is_main_admin(update):
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "❌ فقط ادمین اصلی می‌تواند ادمین حذف کند.",
+                reply_markup=admin_keyboard()
+            )
+
+            return True
+
+        value = text.strip()
+
+        try:
+
+            if value.startswith("👑"):
+
+                admin_id = int(
+                    value.split("👑", 1)[1]
+                    .split("(", 1)[0]
+                    .strip()
+                )
+
+            elif value.startswith("👤"):
+
+                admin_id = int(
+                    value.split("👤", 1)[1]
+                    .strip()
+                )
+
+            else:
+
+                raise ValueError
+
+        except Exception:
+
+            await message.reply_text(
+                "❌ ادمین انتخاب‌شده معتبر نیست."
+            )
+
+            return True
+
+        # جلوگیری از حذف ادمین اصلی
+        if admin_id == ADMIN_ID:
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "❌ ادمین اصلی قابل حذف نیست. 👑",
+                reply_markup=admin_management_keyboard()
+            )
+
+            return True
+
+        query(
+            """
+            DELETE FROM admins
+            WHERE user_id = %s
+            """,
+            (admin_id,)
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ ادمین حذف شد.\n\n"
+            f"🆔 ID: {admin_id}",
+            reply_markup=admin_management_keyboard()
+        )
+
+        return True
+
+    # =====================================================
     # BUTTON NAME
-    # -----------------------------
+    # =====================================================
 
     if state == "add_name":
 
@@ -684,9 +1091,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # BUTTON TYPE
-    # -----------------------------
+    # =====================================================
 
     if state == "add_kind":
 
@@ -755,9 +1162,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # FILE / MESSAGE
-    # -----------------------------
+    # =====================================================
 
     if state == "add_file":
 
@@ -778,9 +1185,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # TEXT BUTTON
-    # -----------------------------
+    # =====================================================
 
     if state == "add_text":
 
@@ -800,9 +1207,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # LINK BUTTON
-    # -----------------------------
+    # =====================================================
 
     if state == "add_link":
 
@@ -835,9 +1242,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # START TEXT
-    # -----------------------------
+    # =====================================================
 
     if state == "start_text":
 
@@ -871,9 +1278,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # BROADCAST
-    # -----------------------------
+    # =====================================================
 
     if state == "broadcast":
 
@@ -914,9 +1321,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # CHILD MENU
-    # -----------------------------
+    # =====================================================
 
     if state == "child_parent":
 
@@ -955,9 +1362,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # RENAME CHOOSE
-    # -----------------------------
+    # =====================================================
 
     if state == "rename_choose":
 
@@ -993,9 +1400,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # RENAME NEW
-    # -----------------------------
+    # =====================================================
 
     if state == "rename_new":
 
@@ -1030,9 +1437,9 @@ async def handle_admin_state(update, context):
 
         return True
 
-    # -----------------------------
+    # =====================================================
     # DELETE
-    # -----------------------------
+    # =====================================================
 
     if state == "delete_choose":
 
@@ -1099,6 +1506,50 @@ async def admin_text_router(update, context):
             return True
 
     text = update.message.text or ""
+
+    # =====================================================
+    # ADMIN MANAGEMENT
+    # =====================================================
+
+    if text == "👥 مدیریت ادمین‌ها":
+
+        await admin_management(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "➕ افزودن ادمین":
+
+        await add_admin_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "🗑 حذف ادمین":
+
+        await remove_admin_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "👥 لیست ادمین‌ها":
+
+        await admin_list(
+            update,
+            context
+        )
+
+        return True
+
+    # =====================================================
+    # BUTTON MANAGEMENT
+    # =====================================================
 
     if text == "➕ افزودن دکمه":
 
@@ -1218,9 +1669,9 @@ async def user_router(update, context):
 
     text = update.message.text
 
-    # -----------------------------
+    # =====================================================
     # BACK
-    # -----------------------------
+    # =====================================================
 
     if text == "🔙 بازگشت":
 
@@ -1238,9 +1689,9 @@ async def user_router(update, context):
 
         return
 
-    # -----------------------------
+    # =====================================================
     # PAGINATION
-    # -----------------------------
+    # =====================================================
 
     if text in (
         "⬅️ صفحه قبل",
@@ -1280,6 +1731,7 @@ async def user_router(update, context):
         )
 
         if page > max_page:
+
             page = max_page
 
         context.user_data["menu_page"] = page
@@ -1296,9 +1748,9 @@ async def user_router(update, context):
 
         return
 
-    # -----------------------------
+    # =====================================================
     # FIND BUTTON
-    # -----------------------------
+    # =====================================================
 
     parent_id = context.user_data.get(
         "menu_parent"
@@ -1324,9 +1776,9 @@ async def user_router(update, context):
     if not button:
         return
 
-    # -----------------------------
+    # =====================================================
     # SUB MENU
-    # -----------------------------
+    # =====================================================
 
     if button["kind"] == "menu":
 
@@ -1346,9 +1798,9 @@ async def user_router(update, context):
 
         return
 
-    # -----------------------------
+    # =====================================================
     # FILE / MESSAGE
-    # -----------------------------
+    # =====================================================
 
     if button["kind"] == "file":
 
@@ -1368,9 +1820,9 @@ async def user_router(update, context):
 
         return
 
-    # -----------------------------
+    # =====================================================
     # TEXT
-    # -----------------------------
+    # =====================================================
 
     if button["kind"] == "text":
 
@@ -1380,9 +1832,9 @@ async def user_router(update, context):
 
         return
 
-    # -----------------------------
+    # =====================================================
     # LINK
-    # -----------------------------
+    # =====================================================
 
     if button["kind"] == "link":
 
@@ -1446,6 +1898,9 @@ async def error_handler(update, context):
 # =========================================================
 
 async def main():
+
+    # ساخت جدول ادمین‌ها
+    init_admin_table()
 
     if not PUBLIC_URL:
 
