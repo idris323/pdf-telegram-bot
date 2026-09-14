@@ -55,11 +55,9 @@ db_pool = None
 # =========================================================
 
 def init_db_pool():
-
     global db_pool
 
     if db_pool is None:
-
         db_pool = ConnectionPool(
             conninfo=DATABASE_URL,
             min_size=1,
@@ -75,14 +73,12 @@ def init_db_pool():
 
 
 def query(sql, params=(), fetch=False, one=False):
-
     global db_pool
 
     if db_pool is None:
         init_db_pool()
 
     with db_pool.connection() as connection:
-
         with connection.cursor() as cursor:
 
             cursor.execute(
@@ -91,7 +87,6 @@ def query(sql, params=(), fetch=False, one=False):
             )
 
             if fetch:
-
                 rows = cursor.fetchall()
 
                 if one:
@@ -105,10 +100,14 @@ def query(sql, params=(), fetch=False, one=False):
 
 
 # =========================================================
-# ADMIN DATABASE
+# DATABASE TABLES
 # =========================================================
 
 def init_admin_table():
+
+    # -----------------------------------------------------
+    # ADMINS
+    # -----------------------------------------------------
 
     query(
         """
@@ -128,6 +127,61 @@ def init_admin_table():
         (ADMIN_ID,)
     )
 
+    # -----------------------------------------------------
+    # MULTIPLE FILES FOR EACH BUTTON
+    # -----------------------------------------------------
+
+    query(
+        """
+        CREATE TABLE IF NOT EXISTS button_files (
+            id BIGSERIAL PRIMARY KEY,
+            button_id BIGINT NOT NULL,
+            source_chat_id BIGINT NOT NULL,
+            source_message_id BIGINT NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            CONSTRAINT unique_button_file
+            UNIQUE (
+                button_id,
+                source_chat_id,
+                source_message_id
+            )
+        )
+        """
+    )
+
+    # -----------------------------------------------------
+    # MOVE OLD FILES INTO NEW TABLE
+    # -----------------------------------------------------
+
+    query(
+        """
+        INSERT INTO button_files (
+            button_id,
+            source_chat_id,
+            source_message_id
+        )
+        SELECT
+            id,
+            source_chat_id,
+            source_message_id
+        FROM buttons
+        WHERE kind = 'file'
+        AND source_chat_id IS NOT NULL
+        AND source_message_id IS NOT NULL
+        ON CONFLICT (
+            button_id,
+            source_chat_id,
+            source_message_id
+        )
+        DO NOTHING
+        """
+    )
+
+    # -----------------------------------------------------
+    # LOAD ADMINS
+    # -----------------------------------------------------
+
     admins = query(
         """
         SELECT user_id
@@ -140,7 +194,6 @@ def init_admin_table():
     ADMIN_CACHE.add(ADMIN_ID)
 
     for admin in admins:
-
         ADMIN_CACHE.add(
             admin["user_id"]
         )
@@ -515,11 +568,9 @@ async def create_button(
         one=True
     )
 
-    sort_order = (
-        result["max_sort"] + 1
-    )
+    sort_order = result["max_sort"] + 1
 
-    query(
+    row = query(
         """
         INSERT INTO buttons
         (
@@ -533,6 +584,7 @@ async def create_button(
         )
         VALUES
         (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
         """,
         (
             parent_id,
@@ -542,6 +594,45 @@ async def create_button(
             source_message_id,
             value,
             sort_order
+        ),
+        fetch=True,
+        one=True
+    )
+
+    return row["id"]
+
+
+# =========================================================
+# ADD FILE TO EXISTING BUTTON
+# =========================================================
+
+async def add_file_to_button(
+    button_id,
+    source_chat_id,
+    source_message_id
+):
+
+    query(
+        """
+        INSERT INTO button_files
+        (
+            button_id,
+            source_chat_id,
+            source_message_id
+        )
+        VALUES
+        (%s, %s, %s)
+        ON CONFLICT (
+            button_id,
+            source_chat_id,
+            source_message_id
+        )
+        DO NOTHING
+        """,
+        (
+            button_id,
+            source_chat_id,
+            source_message_id
         )
     )
 
@@ -788,7 +879,7 @@ async def delete_start(update, context):
 
 
 # =========================================================
-# CHANGE FILE / MESSAGE START
+# ADD MORE FILE / MESSAGE
 # =========================================================
 
 async def change_file_start(update, context):
@@ -839,7 +930,8 @@ async def change_file_start(update, context):
     )
 
     await update.message.reply_text(
-        "📁 دکمه‌ای که می‌خواهی فایل / پیام آن را تغییر بده انتخاب کن:",
+        "📁 دکمه‌ای را انتخاب کن تا فایل یا پیام جدید به آن اضافه شود:\n\n"
+        "⚠️ فایل‌های قبلی حذف یا جایگزین نمی‌شوند.",
         reply_markup=ReplyKeyboardMarkup(
             keyboard,
             resize_keyboard=True
@@ -984,8 +1076,13 @@ async def remove_admin_start(update, context):
         user_id = admin["user_id"]
 
         if user_id == ADMIN_ID:
-            title = f"👑 {user_id} (ادمین اصلی)"
+
+            title = (
+                f"👑 {user_id} (ادمین اصلی)"
+            )
+
         else:
+
             title = f"👤 {user_id}"
 
         keyboard.append(
@@ -1098,36 +1195,87 @@ async def handle_admin_state(update, context):
 
     if text == "🔙 لغو / بازگشت":
 
-        context.user_data.clear()
+        # -----------------------------------------------
+        # اگر داخل یک عملیات هستیم
+        # -----------------------------------------------
 
-        if admin_section == "button_management":
+        if state:
 
-            context.user_data["admin_section"] = (
-                "button_management"
-            )
+            context.user_data.clear()
 
-            await message.reply_text(
-                "🛠 مدیریت دکمه‌ها:",
-                reply_markup=button_management_keyboard()
-            )
+            if admin_section == "button_management":
 
-        elif admin_section == "admin_management":
+                context.user_data["admin_section"] = (
+                    "button_management"
+                )
 
-            context.user_data["admin_section"] = (
-                "admin_management"
-            )
+                await message.reply_text(
+                    "🛠 مدیریت دکمه‌ها:",
+                    reply_markup=button_management_keyboard()
+                )
 
-            await message.reply_text(
-                "👥 مدیریت ادمین‌ها:",
-                reply_markup=admin_management_keyboard()
-            )
+                return True
 
-        else:
+            if admin_section == "admin_management":
+
+                context.user_data["admin_section"] = (
+                    "admin_management"
+                )
+
+                await message.reply_text(
+                    "👥 مدیریت ادمین‌ها:",
+                    reply_markup=admin_management_keyboard()
+                )
+
+                return True
 
             await message.reply_text(
                 "⚙️ پنل مدیریت",
                 reply_markup=admin_keyboard()
             )
+
+            return True
+
+        # -----------------------------------------------
+        # اگر خود صفحه مدیریت دکمه‌ها هستیم
+        # -----------------------------------------------
+
+        if admin_section == "button_management":
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "⚙️ پنل مدیریت",
+                reply_markup=admin_keyboard()
+            )
+
+            return True
+
+        # -----------------------------------------------
+        # اگر صفحه مدیریت ادمین‌ها هستیم
+        # -----------------------------------------------
+
+        if admin_section == "admin_management":
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "⚙️ پنل مدیریت",
+                reply_markup=admin_keyboard()
+            )
+
+            return True
+
+        # -----------------------------------------------
+        # حالت عادی
+        # -----------------------------------------------
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "⚙️ پنل مدیریت",
+            reply_markup=admin_keyboard()
+        )
 
         return True
 
@@ -1333,6 +1481,10 @@ async def handle_admin_state(update, context):
             "parent_id"
         )
 
+        # -------------------------------------------------
+        # SUB MENU
+        # -------------------------------------------------
+
         if text == "📂 منوی فرعی":
 
             await create_button(
@@ -1350,6 +1502,10 @@ async def handle_admin_state(update, context):
 
             return True
 
+        # -------------------------------------------------
+        # FILE
+        # -------------------------------------------------
+
         if text == "📁 فایل / پیام":
 
             context.user_data["state"] = (
@@ -1357,13 +1513,19 @@ async def handle_admin_state(update, context):
             )
 
             await message.reply_text(
-                "📁 حالا فایل یا پیام را بفرست.\n\n"
-                "می‌توانی فایل را مستقیماً بفرستی "
-                "یا یک پیام/فایل را از کانال دیگر Forward کنی.",
+                "📁 حالا اولین فایل یا پیام این دکمه را بفرست.\n\n"
+                "بعداً هر تعداد فایل دیگری هم خواستی "
+                "می‌توانی با گزینه «📁 تغییر فایل / پیام» "
+                "به همین دکمه اضافه کنی.\n\n"
+                "فایل‌های قبلی هیچ‌وقت جایگزین نمی‌شوند.",
                 reply_markup=back_keyboard()
             )
 
             return True
+
+        # -------------------------------------------------
+        # TEXT
+        # -------------------------------------------------
 
         if text == "📝 متن":
 
@@ -1377,6 +1539,10 @@ async def handle_admin_state(update, context):
             )
 
             return True
+
+        # -------------------------------------------------
+        # LINK
+        # -------------------------------------------------
 
         if text == "🔗 لینک":
 
@@ -1399,12 +1565,16 @@ async def handle_admin_state(update, context):
         return True
 
     # =====================================================
-    # ADD FILE
+    # ADD FIRST FILE
     # =====================================================
 
     if state == "add_file":
 
-        await create_button(
+        # -----------------------------------------------
+        # Create the button ONLY ONCE
+        # -----------------------------------------------
+
+        button_id = await create_button(
             title=context.user_data["title"],
             kind="file",
             parent_id=context.user_data.get(
@@ -1414,10 +1584,23 @@ async def handle_admin_state(update, context):
             source_message_id=message.message_id
         )
 
+        # -----------------------------------------------
+        # Save first file in multiple-file table
+        # -----------------------------------------------
+
+        await add_file_to_button(
+            button_id=button_id,
+            source_chat_id=message.chat_id,
+            source_message_id=message.message_id
+        )
+
         context.user_data.clear()
 
         await message.reply_text(
-            "✅ فایل/پیام با موفقیت ثبت شد.",
+            "✅ دکمه فایل ساخته شد.\n\n"
+            "📁 اولین فایل/پیام ثبت شد.\n"
+            "➕ هر تعداد فایل دیگری خواستی می‌توانی "
+            "بعداً به همین دکمه اضافه کنی.",
             reply_markup=admin_keyboard()
         )
 
@@ -1461,14 +1644,17 @@ async def handle_admin_state(update, context):
 
         await message.reply_text(
             "📁 حالا فایل یا پیام جدید را بفرست.\n\n"
-            "فایل قبلی با این فایل/پیام جایگزین می‌شود.",
+            "✅ فایل جدید به فایل‌های قبلی اضافه می‌شود.\n"
+            "❌ هیچ فایل قبلی حذف یا جایگزین نمی‌شود.\n\n"
+            "هر بار که خواستی می‌توانی دوباره همین گزینه "
+            "را انتخاب کنی و فایل دیگری اضافه کنی.",
             reply_markup=back_keyboard()
         )
 
         return True
 
     # =====================================================
-    # CHANGE FILE - SAVE NEW FILE
+    # CHANGE FILE - ADD NEW FILE
     # =====================================================
 
     if state == "change_file":
@@ -1488,26 +1674,22 @@ async def handle_admin_state(update, context):
 
             return True
 
-        query(
-            """
-            UPDATE buttons
-            SET
-                source_chat_id = %s,
-                source_message_id = %s
-            WHERE id = %s
-            AND kind = 'file'
-            """,
-            (
-                message.chat_id,
-                message.message_id,
-                button_id
-            )
+        # -------------------------------------------------
+        # IMPORTANT:
+        # INSERT instead of UPDATE
+        # -------------------------------------------------
+
+        await add_file_to_button(
+            button_id=button_id,
+            source_chat_id=message.chat_id,
+            source_message_id=message.message_id
         )
 
         context.user_data.clear()
 
         await message.reply_text(
-            "✅ فایل / پیام دکمه با موفقیت تغییر کرد.",
+            "✅ فایل / پیام جدید اضافه شد.\n\n"
+            "📁 فایل‌های قبلی همچنان باقی هستند.",
             reply_markup=button_management_keyboard()
         )
 
@@ -1665,7 +1847,8 @@ async def handle_admin_state(update, context):
         )
 
         success = sum(
-            1 for result in results
+            1
+            for result in results
             if result
         )
 
@@ -1830,12 +2013,26 @@ async def handle_admin_state(update, context):
 
             return True
 
+        button_id = row["id"]
+
+        # Delete all files belonging to button first
+
+        query(
+            """
+            DELETE FROM button_files
+            WHERE button_id = %s
+            """,
+            (button_id,)
+        )
+
+        # Delete button
+
         query(
             """
             DELETE FROM buttons
             WHERE id = %s
             """,
-            (row["id"],)
+            (button_id,)
         )
 
         context.user_data.clear()
@@ -1869,52 +2066,6 @@ async def admin_text_router(update, context):
     )
 
     # =====================================================
-    # BACK WITHOUT STATE
-    # =====================================================
-
-    if text == "🔙 لغو / بازگشت" and not state:
-
-        section = context.user_data.get(
-            "admin_section",
-            "main"
-        )
-
-        context.user_data.clear()
-
-        if section == "button_management":
-
-            context.user_data["admin_section"] = (
-                "button_management"
-            )
-
-            await update.message.reply_text(
-                "🛠 مدیریت دکمه‌ها:",
-                reply_markup=button_management_keyboard()
-            )
-
-            return True
-
-        if section == "admin_management":
-
-            context.user_data["admin_section"] = (
-                "admin_management"
-            )
-
-            await update.message.reply_text(
-                "👥 مدیریت ادمین‌ها:",
-                reply_markup=admin_management_keyboard()
-            )
-
-            return True
-
-        await update.message.reply_text(
-            "⚙️ پنل مدیریت",
-            reply_markup=admin_keyboard()
-        )
-
-        return True
-
-    # =====================================================
     # STATE
     # =====================================================
 
@@ -1927,6 +2078,47 @@ async def admin_text_router(update, context):
 
         if handled:
             return True
+
+    # =====================================================
+    # BACK WITHOUT STATE
+    # =====================================================
+
+    if text == "🔙 لغو / بازگشت":
+
+        section = context.user_data.get(
+            "admin_section",
+            "main"
+        )
+
+        context.user_data.clear()
+
+        # IMPORTANT:
+        # Management -> Main Admin Panel
+
+        if section == "button_management":
+
+            await update.message.reply_text(
+                "⚙️ پنل مدیریت",
+                reply_markup=admin_keyboard()
+            )
+
+            return True
+
+        if section == "admin_management":
+
+            await update.message.reply_text(
+                "⚙️ پنل مدیریت",
+                reply_markup=admin_keyboard()
+            )
+
+            return True
+
+        await update.message.reply_text(
+            "⚙️ پنل مدیریت",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
 
     # =====================================================
     # ADMIN MANAGEMENT
@@ -2104,7 +2296,7 @@ async def user_router(update, context):
     text = update.message.text
 
     # =====================================================
-    # BACK
+    # USER BACK
     # =====================================================
 
     if text == "🔙 بازگشت":
@@ -2234,32 +2426,99 @@ async def user_router(update, context):
         return
 
     # =====================================================
-    # FILE
+    # MULTIPLE FILES
     # =====================================================
 
     if button["kind"] == "file":
 
-        try:
+        files = query(
+            """
+            SELECT
+                source_chat_id,
+                source_message_id
+            FROM button_files
+            WHERE button_id = %s
+            ORDER BY id
+            """,
+            (
+                button["id"],
+            ),
+            fetch=True
+        )
 
-            await context.bot.copy_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=button[
-                    "source_chat_id"
-                ],
-                message_id=button[
-                    "source_message_id"
+        # -------------------------------------------------
+        # Fallback for old data
+        # -------------------------------------------------
+
+        if not files:
+
+            if (
+                button["source_chat_id"] is not None
+                and
+                button["source_message_id"] is not None
+            ):
+
+                files = [
+                    {
+                        "source_chat_id":
+                            button["source_chat_id"],
+
+                        "source_message_id":
+                            button["source_message_id"]
+                    }
                 ]
-            )
 
-        except Exception as e:
-
-            logger.warning(
-                "File copy failed: %s",
-                e
-            )
+        if not files:
 
             await update.message.reply_text(
-                "❌ این فایل/پیام دیگر قابل دریافت نیست."
+                "❌ هیچ فایل یا پیامی برای این دکمه ثبت نشده است."
+            )
+
+            return
+
+        # -------------------------------------------------
+        # Send ALL files
+        # -------------------------------------------------
+
+        success = 0
+        failed = 0
+
+        for file in files:
+
+            try:
+
+                await context.bot.copy_message(
+                    chat_id=update.effective_chat.id,
+                    from_chat_id=file[
+                        "source_chat_id"
+                    ],
+                    message_id=file[
+                        "source_message_id"
+                    ]
+                )
+
+                success += 1
+
+            except Exception as e:
+
+                failed += 1
+
+                logger.warning(
+                    "File copy failed: %s",
+                    e
+                )
+
+        if success == 0:
+
+            await update.message.reply_text(
+                "❌ فایل‌ها دیگر قابل دریافت نیستند."
+            )
+
+        elif failed > 0:
+
+            await update.message.reply_text(
+                f"⚠️ {success} فایل ارسال شد و "
+                f"{failed} فایل ارسال نشد."
             )
 
         return
@@ -2304,7 +2563,7 @@ async def all_messages(update, context):
             "state"
         )
 
-        # فایل جدید هنگام ساخت
+        # File while creating button
         if state == "add_file":
 
             handled = await handle_admin_state(
@@ -2315,7 +2574,7 @@ async def all_messages(update, context):
             if handled:
                 return
 
-        # فایل جدید هنگام ویرایش
+        # Add another file
         if state == "change_file":
 
             handled = await handle_admin_state(
