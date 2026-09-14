@@ -1,505 +1,1591 @@
 import os
-import sqlite3
 import asyncio
+import logging
+import html
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from aiohttp import web
+import psycopg
+from psycopg.rows import dict_row
+
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# =========================================================
+# SETTINGS
+# =========================================================
 
-DB = "bot.db"
+TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+PUBLIC_URL = (
+    os.environ.get("WEBHOOK_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+)
+
+PORT = int(os.environ.get("PORT", "10000"))
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
 
 
-# ================= DATABASE =================
+# =========================================================
+# DATABASE
+# =========================================================
 
 def db():
-    return sqlite3.connect(DB)
-
-
-def init_db():
-    con = db()
-    cur = con.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            file_id TEXT NOT NULL
-        )
-    """)
-
-    con.commit()
-    con.close()
-
-
-def add_user(user_id):
-    con = db()
-    con.execute(
-        "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
-        (user_id,)
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row
     )
-    con.commit()
-    con.close()
 
 
-def get_files():
-    con = db()
-    rows = con.execute(
-        "SELECT id, name FROM files ORDER BY id DESC"
-    ).fetchall()
-    con.close()
-    return rows
+def query(sql, params=(), fetch=False, one=False):
+    with db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+
+            if fetch:
+                rows = cursor.fetchall()
+
+                if one:
+                    return rows[0] if rows else None
+
+                return rows
+
+        connection.commit()
+
+    return None
 
 
-def get_file(file_id):
-    con = db()
-    row = con.execute(
-        "SELECT name, file_id FROM files WHERE id=?",
-        (file_id,)
-    ).fetchone()
-    con.close()
-    return row
+# =========================================================
+# ADMIN CHECK
+# =========================================================
 
-
-def save_file(name, file_id):
-    con = db()
-    con.execute(
-        "INSERT INTO files(name, file_id) VALUES(?, ?)",
-        (name, file_id)
+def is_admin(update):
+    return (
+        update.effective_user is not None
+        and update.effective_user.id == ADMIN_ID
     )
-    con.commit()
-    con.close()
 
 
-def delete_file(file_id):
-    con = db()
-    con.execute(
-        "DELETE FROM files WHERE id=?",
-        (file_id,)
-    )
-    con.commit()
-    con.close()
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
-
-def get_users():
-    con = db()
-    rows = con.execute("SELECT user_id FROM users").fetchall()
-    con.close()
-    return [r[0] for r in rows]
-
-
-# ================= USER MENU =================
-
-def user_menu():
-    keyboard = [
-        [InlineKeyboardButton("📚 فایل‌های PDF", callback_data="files")],
+def admin_keyboard():
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton("ℹ️ درباره ربات", callback_data="about"),
-            InlineKeyboardButton("📞 پشتیبانی", callback_data="support"),
+            [
+                KeyboardButton("➕ افزودن دکمه"),
+                KeyboardButton("🛠 مدیریت دکمه‌ها")
+            ],
+            [
+                KeyboardButton("✏️ متن /start"),
+                KeyboardButton("📊 آمار کاربران")
+            ],
+            [
+                KeyboardButton("📢 ارسال همگانی"),
+                KeyboardButton("👤 منوی کاربر")
+            ],
         ],
-    ]
+        resize_keyboard=True
+    )
 
-    return InlineKeyboardMarkup(keyboard)
+
+def back_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🔙 لغو / بازگشت")]
+        ],
+        resize_keyboard=True
+    )
 
 
-# ================= START =================
+# =========================================================
+# USER MENU
+# =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def user_keyboard(parent_id=None, page=0):
+
+    buttons = query(
+        """
+        SELECT id, title, kind
+        FROM buttons
+        WHERE parent_id IS NOT DISTINCT FROM %s
+        ORDER BY sort_order, id
+        """,
+        (parent_id,),
+        fetch=True
+    )
+
+    per_page = 8
+
+    start = page * per_page
+    current = buttons[start:start + per_page]
+
+    keyboard = []
+
+    for button in current:
+        keyboard.append(
+            [KeyboardButton(button["title"])]
+        )
+
+    navigation = []
+
+    if page > 0:
+        navigation.append(
+            KeyboardButton("⬅️ صفحه قبل")
+        )
+
+    if start + per_page < len(buttons):
+        navigation.append(
+            KeyboardButton("➡️ صفحه بعد")
+        )
+
+    if navigation:
+        keyboard.append(navigation)
+
+    if parent_id is not None:
+        keyboard.append(
+            [KeyboardButton("🔙 بازگشت")]
+        )
+
+    return (
+        ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        ),
+        current,
+        len(buttons)
+    )
+
+
+# =========================================================
+# START TEXT
+# =========================================================
+
+def get_start_text():
+
+    row = query(
+        """
+        SELECT value
+        FROM settings
+        WHERE key = 'start_text'
+        """,
+        fetch=True,
+        one=True
+    )
+
+    if row:
+        return row["value"]
+
+    return "سلام 👋 به ربات ما خوش آمدید!"
+
+
+# =========================================================
+# STATE
+# =========================================================
+
+def set_state(context, state, **data):
+
+    context.user_data.clear()
+
+    context.user_data["state"] = state
+
+    for key, value in data.items():
+        context.user_data[key] = value
+
+
+# =========================================================
+# SAVE USER
+# =========================================================
+
+async def save_user(update):
 
     user = update.effective_user
-    add_user(user.id)
 
-    await update.message.reply_text(
-        "👋 سلام!\n\n"
-        "به کتابخانه PDF خوش آمدید.\n"
-        "از منوی زیر فایل مورد نظر خود را انتخاب کنید:",
-        reply_markup=user_menu()
+    if not user:
+        return
+
+    query(
+        """
+        INSERT INTO users
+        (
+            user_id,
+            first_name,
+            username
+        )
+        VALUES
+        (%s, %s, %s)
+
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            first_name = EXCLUDED.first_name,
+            username = EXCLUDED.username
+        """,
+        (
+            user.id,
+            user.first_name or "",
+            user.username or ""
+        )
     )
 
 
-# ================= FILE LIST =================
+# =========================================================
+# START
+# =========================================================
 
-async def show_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update, context):
 
-    query = update.callback_query
-    await query.answer()
+    await save_user(update)
 
-    files = get_files()
+    context.user_data.clear()
 
-    if not files:
-        await query.edit_message_text(
-            "📂 هنوز هیچ فایلی اضافه نشده است.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 برگشت", callback_data="home")]
-            ])
+    keyboard, _, _ = user_keyboard()
+
+    await update.message.reply_text(
+        get_start_text(),
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# ADMIN COMMAND
+# =========================================================
+
+async def admin_command(update, context):
+
+    if not is_admin(update):
+        return
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "⚙️ پنل مدیریت ربات",
+        reply_markup=admin_keyboard()
+    )
+
+
+# =========================================================
+# USER HOME
+# =========================================================
+
+async def show_root(update):
+
+    keyboard, _, _ = user_keyboard()
+
+    await update.message.reply_text(
+        get_start_text(),
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# CREATE BUTTON
+# =========================================================
+
+async def create_button(
+    title,
+    kind,
+    parent_id=None,
+    source_chat_id=None,
+    source_message_id=None,
+    value=None
+):
+
+    result = query(
+        """
+        SELECT COALESCE(MAX(sort_order), 0) AS max_sort
+        FROM buttons
+        WHERE parent_id IS NOT DISTINCT FROM %s
+        """,
+        (parent_id,),
+        fetch=True,
+        one=True
+    )
+
+    sort_order = result["max_sort"] + 1
+
+    query(
+        """
+        INSERT INTO buttons
+        (
+            parent_id,
+            title,
+            kind,
+            source_chat_id,
+            source_message_id,
+            value,
+            sort_order
         )
+        VALUES
+        (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            parent_id,
+            title,
+            kind,
+            source_chat_id,
+            source_message_id,
+            value,
+            sort_order
+        )
+    )
+
+
+# =========================================================
+# ADD BUTTON
+# =========================================================
+
+async def add_button_start(update, context):
+
+    if not is_admin(update):
+        return
+
+    set_state(
+        context,
+        "add_name",
+        parent_id=None
+    )
+
+    await update.message.reply_text(
+        "➕ نام دکمه را بفرست:",
+        reply_markup=back_keyboard()
+    )
+
+
+# =========================================================
+# BUTTON TYPE
+# =========================================================
+
+async def ask_button_type(update, context):
+
+    keyboard = ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("📁 فایل / پیام"),
+                KeyboardButton("📂 منوی فرعی")
+            ],
+            [
+                KeyboardButton("📝 متن"),
+                KeyboardButton("🔗 لینک")
+            ],
+            [
+                KeyboardButton("🔙 لغو / بازگشت")
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "نوع دکمه را انتخاب کن:",
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# ADD CHILD MENU
+# =========================================================
+
+async def add_child_start(update, context):
+
+    menus = query(
+        """
+        SELECT id, title
+        FROM buttons
+        WHERE kind = 'menu'
+        ORDER BY id
+        """,
+        fetch=True
+    )
+
+    if not menus:
+
+        await update.message.reply_text(
+            "❌ هنوز هیچ منوی فرعی ساخته نشده است.",
+            reply_markup=admin_keyboard()
+        )
+
         return
 
     keyboard = []
 
-    for file_id, name in files:
-        keyboard.append([
-            InlineKeyboardButton(
-                "📄 " + name,
-                callback_data=f"send_{file_id}"
-            )
-        ])
+    for menu in menus:
+        keyboard.append(
+            [KeyboardButton(menu["title"])]
+        )
 
-    keyboard.append([
-        InlineKeyboardButton("🔙 برگشت", callback_data="home")
-    ])
+    keyboard.append(
+        [KeyboardButton("🔙 لغو / بازگشت")]
+    )
 
-    await query.edit_message_text(
-        "📚 فایل‌های موجود:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    set_state(
+        context,
+        "child_parent"
+    )
+
+    await update.message.reply_text(
+        "📂 منوی والد را انتخاب کن:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
     )
 
 
-# ================= SEND PDF =================
+# =========================================================
+# MANAGEMENT
+# =========================================================
 
-async def send_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def management_menu(update, context):
 
-    query = update.callback_query
-    await query.answer()
+    keyboard = ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("➕ افزودن دکمه اصلی"),
+                KeyboardButton("➕ افزودن زیرمنو")
+            ],
+            [
+                KeyboardButton("✏️ تغییر نام"),
+                KeyboardButton("🗑 حذف دکمه")
+            ],
+            [
+                KeyboardButton("🔙 لغو / بازگشت")
+            ]
+        ],
+        resize_keyboard=True
+    )
 
-    file_id = int(query.data.split("_")[1])
-
-    data = get_file(file_id)
-
-    if not data:
-        await query.message.reply_text("❌ فایل پیدا نشد.")
-        return
-
-    name, telegram_file_id = data
-
-    await query.message.reply_document(
-        document=telegram_file_id,
-        caption=f"📄 {name}"
+    await update.message.reply_text(
+        "🛠 مدیریت دکمه‌ها:",
+        reply_markup=keyboard
     )
 
 
-# ================= ADMIN PANEL =================
+# =========================================================
+# RENAME BUTTON
+# =========================================================
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rename_start(update, context):
 
-    if update.effective_user.id != ADMIN_ID:
+    buttons = query(
+        """
+        SELECT id, title
+        FROM buttons
+        ORDER BY id
+        """,
+        fetch=True
+    )
+
+    if not buttons:
+
+        await update.message.reply_text(
+            "❌ هنوز دکمه‌ای ساخته نشده.",
+            reply_markup=admin_keyboard()
+        )
+
         return
 
     keyboard = [
-        [InlineKeyboardButton("➕ افزودن PDF", callback_data="add")],
-        [InlineKeyboardButton("📂 مدیریت فایل‌ها", callback_data="manage")],
-        [InlineKeyboardButton("👥 آمار کاربران", callback_data="stats")],
-        [InlineKeyboardButton("📢 ارسال همگانی", callback_data="broadcast")],
+        [KeyboardButton(button["title"])]
+        for button in buttons
     ]
 
+    keyboard.append(
+        [KeyboardButton("🔙 لغو / بازگشت")]
+    )
+
+    set_state(
+        context,
+        "rename_choose"
+    )
+
     await update.message.reply_text(
-        "🔐 پنل مدیریت\n\n"
-        "یکی از گزینه‌ها را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ================= ADD PDF =================
-
-async def add_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-        return
-
-    context.user_data["adding_pdf"] = True
-
-    await query.message.reply_text(
-        "📄 PDF را همینجا برای من ارسال کن.\n\n"
-        "بعد از ارسال، نام فایل را از تو می‌پرسم."
-    )
-
-
-async def receive_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not context.user_data.get("adding_pdf"):
-        return
-
-    if not update.message.document:
-        return
-
-    document = update.message.document
-
-    if document.mime_type != "application/pdf":
-        await update.message.reply_text(
-            "❌ لطفاً فقط فایل PDF ارسال کن."
+        "✏️ دکمه‌ای که می‌خواهی تغییر نام بده انتخاب کن:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
         )
-        return
-
-    context.user_data["pdf_file_id"] = document.file_id
-    context.user_data["adding_pdf"] = False
-    context.user_data["waiting_name"] = True
-
-    await update.message.reply_text(
-        "✅ PDF دریافت شد.\n\n"
-        "حالا نامی که می‌خواهی روی دکمه نمایش داده شود را بفرست."
     )
 
 
-async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# DELETE BUTTON
+# =========================================================
 
-    if update.effective_user.id != ADMIN_ID:
+async def delete_start(update, context):
+
+    buttons = query(
+        """
+        SELECT id, title
+        FROM buttons
+        ORDER BY id
+        """,
+        fetch=True
+    )
+
+    if not buttons:
+
+        await update.message.reply_text(
+            "❌ هنوز دکمه‌ای ساخته نشده.",
+            reply_markup=admin_keyboard()
+        )
+
         return
 
-    if not context.user_data.get("waiting_name"):
-        return
+    keyboard = [
+        [KeyboardButton(button["title"])]
+        for button in buttons
+    ]
 
-    name = update.message.text
-    file_id = context.user_data.get("pdf_file_id")
+    keyboard.append(
+        [KeyboardButton("🔙 لغو / بازگشت")]
+    )
 
-    if not file_id:
-        return
-
-    save_file(name, file_id)
-
-    context.user_data["waiting_name"] = False
-    context.user_data["pdf_file_id"] = None
+    set_state(
+        context,
+        "delete_choose"
+    )
 
     await update.message.reply_text(
-        f"✅ فایل با موفقیت اضافه شد.\n\n"
-        f"📄 نام: {name}"
+        "🗑 دکمه‌ای که می‌خواهی حذف کنی انتخاب کن:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
     )
 
 
-# ================= MANAGE FILES =================
+# =========================================================
+# START TEXT EDIT
+# =========================================================
 
-async def manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def edit_start_text(update, context):
 
-    query = update.callback_query
-    await query.answer()
+    set_state(
+        context,
+        "start_text"
+    )
 
-    if query.from_user.id != ADMIN_ID:
-        return
+    await update.message.reply_text(
+        "✏️ متن فعلی:\n\n"
+        + get_start_text()
+        + "\n\n"
+        "متن جدید را بفرست:",
+        reply_markup=back_keyboard()
+    )
 
-    files = get_files()
 
-    if not files:
-        await query.message.reply_text("📂 فایلی وجود ندارد.")
-        return
+# =========================================================
+# STATISTICS
+# =========================================================
 
-    keyboard = []
+async def statistics(update, context):
 
-    for file_id, name in files:
-        keyboard.append([
-            InlineKeyboardButton(
-                "🗑 " + name,
-                callback_data=f"delete_{file_id}"
+    result = query(
+        """
+        SELECT COUNT(*) AS total
+        FROM users
+        """,
+        fetch=True,
+        one=True
+    )
+
+    await update.message.reply_text(
+        f"📊 تعداد کاربران: {result['total']}",
+        reply_markup=admin_keyboard()
+    )
+
+
+# =========================================================
+# BROADCAST
+# =========================================================
+
+async def broadcast_start(update, context):
+
+    set_state(
+        context,
+        "broadcast"
+    )
+
+    await update.message.reply_text(
+        "📢 حالا هر چیزی که می‌خواهی برای کاربران ارسال شود بفرست.\n\n"
+        "متن، عکس، ویدیو، PDF، فایل، صوت و غیره.",
+        reply_markup=back_keyboard()
+    )
+
+
+# =========================================================
+# ADMIN STATE HANDLER
+# =========================================================
+
+async def handle_admin_state(update, context):
+
+    if not is_admin(update):
+        return False
+
+    message = update.message
+
+    if not message:
+        return False
+
+    text = message.text or ""
+
+    state = context.user_data.get("state")
+
+    # -----------------------------
+    # CANCEL
+    # -----------------------------
+
+    if text == "🔙 لغو / بازگشت":
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "⚙️ پنل مدیریت",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # BUTTON NAME
+    # -----------------------------
+
+    if state == "add_name":
+
+        if not text.strip():
+
+            await message.reply_text(
+                "❌ نام دکمه نمی‌تواند خالی باشد."
             )
-        ])
 
-    await query.message.reply_text(
-        "📂 برای حذف فایل روی آن بزن:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+            return True
+
+        context.user_data["title"] = text.strip()
+
+        context.user_data["state"] = "add_kind"
+
+        await ask_button_type(
+            update,
+            context
+        )
+
+        return True
+
+    # -----------------------------
+    # BUTTON TYPE
+    # -----------------------------
+
+    if state == "add_kind":
+
+        title = context.user_data["title"]
+
+        parent_id = context.user_data.get(
+            "parent_id"
+        )
+
+        if text == "📂 منوی فرعی":
+
+            await create_button(
+                title=title,
+                kind="menu",
+                parent_id=parent_id
+            )
+
+            context.user_data.clear()
+
+            await message.reply_text(
+                "✅ منوی فرعی ساخته شد.",
+                reply_markup=admin_keyboard()
+            )
+
+            return True
+
+        if text == "📁 فایل / پیام":
+
+            context.user_data["state"] = "add_file"
+
+            await message.reply_text(
+                "📁 حالا فایل یا پیام را بفرست.\n\n"
+                "می‌توانی فایل را مستقیماً بفرستی "
+                "یا یک پیام/فایل را از کانال دیگر Forward کنی.",
+                reply_markup=back_keyboard()
+            )
+
+            return True
+
+        if text == "📝 متن":
+
+            context.user_data["state"] = "add_text"
+
+            await message.reply_text(
+                "📝 متن این دکمه را بفرست:",
+                reply_markup=back_keyboard()
+            )
+
+            return True
+
+        if text == "🔗 لینک":
+
+            context.user_data["state"] = "add_link"
+
+            await message.reply_text(
+                "🔗 آدرس لینک را بفرست:\n"
+                "مثلاً https://example.com",
+                reply_markup=back_keyboard()
+            )
+
+            return True
+
+        await message.reply_text(
+            "یکی از گزینه‌ها را انتخاب کن."
+        )
+
+        return True
+
+    # -----------------------------
+    # FILE / MESSAGE
+    # -----------------------------
+
+    if state == "add_file":
+
+        await create_button(
+            title=context.user_data["title"],
+            kind="file",
+            parent_id=context.user_data.get("parent_id"),
+            source_chat_id=message.chat_id,
+            source_message_id=message.message_id
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ فایل/پیام با موفقیت ثبت شد.",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # TEXT BUTTON
+    # -----------------------------
+
+    if state == "add_text":
+
+        await create_button(
+            title=context.user_data["title"],
+            kind="text",
+            parent_id=context.user_data.get("parent_id"),
+            value=message.text or ""
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ دکمه متنی ساخته شد.",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # LINK BUTTON
+    # -----------------------------
+
+    if state == "add_link":
+
+        value = (message.text or "").strip()
+
+        if not (
+            value.startswith("https://")
+            or value.startswith("http://")
+        ):
+
+            await message.reply_text(
+                "❌ لینک باید با http:// یا https:// شروع شود."
+            )
+
+            return True
+
+        await create_button(
+            title=context.user_data["title"],
+            kind="link",
+            parent_id=context.user_data.get("parent_id"),
+            value=value
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ دکمه لینک ساخته شد.",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # START TEXT
+    # -----------------------------
+
+    if state == "start_text":
+
+        value = (message.text or "").strip()
+
+        if not value:
+
+            await message.reply_text(
+                "❌ متن نمی‌تواند خالی باشد."
+            )
+
+            return True
+
+        query(
+            """
+            INSERT INTO settings(key, value)
+            VALUES('start_text', %s)
+
+            ON CONFLICT(key)
+            DO UPDATE SET value = EXCLUDED.value
+            """,
+            (value,)
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ متن /start تغییر کرد.",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # BROADCAST
+    # -----------------------------
+
+    if state == "broadcast":
+
+        users = query(
+            "SELECT user_id FROM users",
+            fetch=True
+        )
+
+        success = 0
+        failed = 0
+
+        for user in users:
+
+            try:
+
+                await context.bot.copy_message(
+                    chat_id=user["user_id"],
+                    from_chat_id=message.chat_id,
+                    message_id=message.message_id
+                )
+
+                success += 1
+
+                await asyncio.sleep(0.05)
+
+            except Exception:
+
+                failed += 1
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "📢 ارسال همگانی تمام شد.\n\n"
+            f"✅ موفق: {success}\n"
+            f"❌ ناموفق: {failed}",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # CHILD MENU
+    # -----------------------------
+
+    if state == "child_parent":
+
+        row = query(
+            """
+            SELECT id, title
+            FROM buttons
+            WHERE title = %s
+            AND kind = 'menu'
+            ORDER BY id
+            LIMIT 1
+            """,
+            (text,),
+            fetch=True,
+            one=True
+        )
+
+        if not row:
+
+            await message.reply_text(
+                "❌ این دکمه منوی فرعی نیست."
+            )
+
+            return True
+
+        set_state(
+            context,
+            "add_name",
+            parent_id=row["id"]
+        )
+
+        await message.reply_text(
+            "➕ نام دکمه زیرمجموعه را بفرست:",
+            reply_markup=back_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # RENAME CHOOSE
+    # -----------------------------
+
+    if state == "rename_choose":
+
+        row = query(
+            """
+            SELECT id, title
+            FROM buttons
+            WHERE title = %s
+            ORDER BY id
+            LIMIT 1
+            """,
+            (text,),
+            fetch=True,
+            one=True
+        )
+
+        if not row:
+
+            await message.reply_text(
+                "❌ دکمه پیدا نشد."
+            )
+
+            return True
+
+        context.user_data["button_id"] = row["id"]
+
+        context.user_data["state"] = "rename_new"
+
+        await message.reply_text(
+            "✏️ نام جدید را بفرست:",
+            reply_markup=back_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # RENAME NEW
+    # -----------------------------
+
+    if state == "rename_new":
+
+        new_title = text.strip()
+
+        if not new_title:
+
+            await message.reply_text(
+                "❌ نام نمی‌تواند خالی باشد."
+            )
+
+            return True
+
+        query(
+            """
+            UPDATE buttons
+            SET title = %s
+            WHERE id = %s
+            """,
+            (
+                new_title,
+                context.user_data["button_id"]
+            )
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ نام دکمه تغییر کرد.",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    # -----------------------------
+    # DELETE
+    # -----------------------------
+
+    if state == "delete_choose":
+
+        row = query(
+            """
+            SELECT id
+            FROM buttons
+            WHERE title = %s
+            ORDER BY id
+            LIMIT 1
+            """,
+            (text,),
+            fetch=True,
+            one=True
+        )
+
+        if not row:
+
+            await message.reply_text(
+                "❌ دکمه پیدا نشد."
+            )
+
+            return True
+
+        query(
+            """
+            DELETE FROM buttons
+            WHERE id = %s
+            """,
+            (row["id"],)
+        )
+
+        context.user_data.clear()
+
+        await message.reply_text(
+            "🗑 دکمه حذف شد.",
+            reply_markup=admin_keyboard()
+        )
+
+        return True
+
+    return False
 
 
-async def delete_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# ADMIN TEXT ROUTER
+# =========================================================
 
-    query = update.callback_query
-    await query.answer()
+async def admin_text_router(update, context):
 
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(update):
+        return False
+
+    state = context.user_data.get("state")
+
+    if state:
+
+        handled = await handle_admin_state(
+            update,
+            context
+        )
+
+        if handled:
+            return True
+
+    text = update.message.text or ""
+
+    if text == "➕ افزودن دکمه":
+
+        await add_button_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "🛠 مدیریت دکمه‌ها":
+
+        await management_menu(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "✏️ متن /start":
+
+        await edit_start_text(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "📊 آمار کاربران":
+
+        await statistics(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "📢 ارسال همگانی":
+
+        await broadcast_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "👤 منوی کاربر":
+
+        await show_root(
+            update
+        )
+
+        return True
+
+    if text == "➕ افزودن دکمه اصلی":
+
+        await add_button_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "➕ افزودن زیرمنو":
+
+        await add_child_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "✏️ تغییر نام":
+
+        await rename_start(
+            update,
+            context
+        )
+
+        return True
+
+    if text == "🗑 حذف دکمه":
+
+        await delete_start(
+            update,
+            context
+        )
+
+        return True
+
+    return False
+
+
+# =========================================================
+# USER BUTTONS
+# =========================================================
+
+async def user_router(update, context):
+
+    if not update.message:
         return
 
-    file_id = int(query.data.split("_")[1])
-
-    delete_file(file_id)
-
-    await query.message.reply_text(
-        "✅ فایل حذف شد."
-    )
-
-
-# ================= STATISTICS =================
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
+    if not update.message.text:
         return
 
-    users = len(get_users())
-    files = len(get_files())
+    if is_admin(update):
 
-    await query.message.reply_text(
-        "📊 آمار ربات\n\n"
-        f"👥 کاربران: {users}\n"
-        f"📚 فایل‌ها: {files}"
-    )
+        handled = await admin_text_router(
+            update,
+            context
+        )
 
+        if handled:
+            return
 
-# ================= BROADCAST =================
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-        return
-
-    context.user_data["broadcast"] = True
-
-    await query.message.reply_text(
-        "📢 پیام همگانی\n\n"
-        "پیامی که می‌خواهی برای کاربران ارسال شود را بفرست."
-    )
-
-
-async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not context.user_data.get("broadcast"):
-        return
+    await save_user(update)
 
     text = update.message.text
 
-    context.user_data["broadcast"] = False
+    # -----------------------------
+    # BACK
+    # -----------------------------
 
-    users = get_users()
+    if text == "🔙 بازگشت":
 
-    success = 0
+        context.user_data.pop(
+            "menu_parent",
+            None
+        )
 
-    for user_id in users:
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text
+        context.user_data.pop(
+            "menu_page",
+            None
+        )
+
+        await show_root(update)
+
+        return
+
+    # -----------------------------
+    # PAGINATION
+    # -----------------------------
+
+    if text in (
+        "⬅️ صفحه قبل",
+        "➡️ صفحه بعد"
+    ):
+
+        parent_id = context.user_data.get(
+            "menu_parent"
+        )
+
+        page = int(
+            context.user_data.get(
+                "menu_page",
+                0
             )
-            success += 1
-            await asyncio.sleep(0.05)
+        )
+
+        if text.startswith("⬅️"):
+
+            page = max(
+                0,
+                page - 1
+            )
+
+        else:
+
+            page += 1
+
+        keyboard, _, total = user_keyboard(
+            parent_id,
+            page
+        )
+
+        max_page = max(
+            0,
+            (total - 1) // 8
+        )
+
+        if page > max_page:
+            page = max_page
+
+        context.user_data["menu_page"] = page
+
+        keyboard, _, _ = user_keyboard(
+            parent_id,
+            page
+        )
+
+        await update.message.reply_text(
+            "📄 صفحه",
+            reply_markup=keyboard
+        )
+
+        return
+
+    # -----------------------------
+    # FIND BUTTON
+    # -----------------------------
+
+    parent_id = context.user_data.get(
+        "menu_parent"
+    )
+
+    button = query(
+        """
+        SELECT *
+        FROM buttons
+        WHERE parent_id IS NOT DISTINCT FROM %s
+        AND title = %s
+        ORDER BY id
+        LIMIT 1
+        """,
+        (
+            parent_id,
+            text
+        ),
+        fetch=True,
+        one=True
+    )
+
+    if not button:
+        return
+
+    # -----------------------------
+    # SUB MENU
+    # -----------------------------
+
+    if button["kind"] == "menu":
+
+        context.user_data["menu_parent"] = button["id"]
+
+        context.user_data["menu_page"] = 0
+
+        keyboard, _, _ = user_keyboard(
+            button["id"],
+            0
+        )
+
+        await update.message.reply_text(
+            "📂 منوی انتخاب‌شده:",
+            reply_markup=keyboard
+        )
+
+        return
+
+    # -----------------------------
+    # FILE / MESSAGE
+    # -----------------------------
+
+    if button["kind"] == "file":
+
+        try:
+
+            await context.bot.copy_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=button["source_chat_id"],
+                message_id=button["source_message_id"]
+            )
 
         except Exception:
-            pass
 
-    await update.message.reply_text(
-        f"✅ پیام ارسال شد.\n\n"
-        f"👥 تعداد ارسال موفق: {success}"
+            await update.message.reply_text(
+                "❌ این فایل/پیام دیگر قابل دریافت نیست."
+            )
+
+        return
+
+    # -----------------------------
+    # TEXT
+    # -----------------------------
+
+    if button["kind"] == "text":
+
+        await update.message.reply_text(
+            button["value"] or ""
+        )
+
+        return
+
+    # -----------------------------
+    # LINK
+    # -----------------------------
+
+    if button["kind"] == "link":
+
+        url = button["value"] or ""
+
+        await update.message.reply_text(
+            url
+        )
+
+        return
+
+
+# =========================================================
+# ALL MESSAGES
+# =========================================================
+
+async def all_messages(update, context):
+
+    if not update.message:
+        return
+
+    if is_admin(update):
+
+        state = context.user_data.get(
+            "state"
+        )
+
+        if state in (
+            "add_file",
+            "broadcast"
+        ):
+
+            handled = await handle_admin_state(
+                update,
+                context
+            )
+
+            if handled:
+                return
+
+    await user_router(
+        update,
+        context
     )
 
 
-# ================= BUTTONS =================
+# =========================================================
+# ERROR
+# =========================================================
 
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(update, context):
 
-    query = update.callback_query
-    await query.answer()
+    logger.error(
+        "Telegram error: %s",
+        context.error
+    )
 
-    if query.data == "files":
-        await show_files(update, context)
 
-    elif query.data.startswith("send_"):
-        await send_pdf(update, context)
+# =========================================================
+# WEBHOOK SERVER
+# =========================================================
 
-    elif query.data == "home":
+async def main():
 
-        await query.edit_message_text(
-            "🏠 منوی اصلی:",
-            reply_markup=user_menu()
+    if not PUBLIC_URL:
+
+        raise RuntimeError(
+            "WEBHOOK_URL or RENDER_EXTERNAL_URL is required."
         )
 
-    elif query.data == "about":
+    application = (
+        Application
+        .builder()
+        .token(TOKEN)
+        .updater(None)
+        .build()
+    )
 
-        await query.edit_message_text(
-            "ℹ️ درباره ربات\n\n"
-            "این ربات برای دریافت فایل‌های PDF ساخته شده است.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 برگشت", callback_data="home")]
-            ])
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
         )
+    )
 
-    elif query.data == "support":
-
-        await query.edit_message_text(
-            "📞 پشتیبانی\n\n"
-            "برای پشتیبانی با مدیر ربات تماس بگیرید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 برگشت", callback_data="home")]
-            ])
+    application.add_handler(
+        CommandHandler(
+            "admin",
+            admin_command
         )
+    )
 
-    elif query.data == "add":
-        await add_pdf(update, context)
-
-    elif query.data == "manage":
-        await manage(update, context)
-
-    elif query.data.startswith("delete_"):
-        await delete_pdf(update, context)
-
-    elif query.data == "stats":
-        await stats(update, context)
-
-    elif query.data == "broadcast":
-        await broadcast(update, context)
-
-
-# ================= MAIN =================
-
-def main():
-
-    init_db()
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin))
-
-    app.add_handler(CallbackQueryHandler(buttons))
-
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
-            filters.Document.PDF,
-            receive_pdf
+            filters.ALL & ~filters.COMMAND,
+            all_messages
         )
     )
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            receive_name
-        )
+    application.add_error_handler(
+        error_handler
     )
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            receive_broadcast
-        )
+    await application.initialize()
+
+    await application.start()
+
+    webhook_path = (
+        "/telegram/"
+        + TOKEN
     )
 
-    print("Bot started...")
+    webhook_url = (
+        PUBLIC_URL.rstrip("/")
+        + webhook_path
+    )
 
-    app.run_polling()
+    await application.bot.set_webhook(
+        url=webhook_url,
+        allowed_updates=Update.ALL_TYPES
+    )
 
+    web_app = web.Application()
+
+    async def health(request):
+
+        return web.Response(
+            text="OK"
+        )
+
+    async def telegram_webhook(request):
+
+        if request.path != webhook_path:
+
+            return web.Response(
+                status=404
+            )
+
+        data = await request.json()
+
+        update = Update.de_json(
+            data=data,
+            bot=application.bot
+        )
+
+        await application.update_queue.put(
+            update
+        )
+
+        return web.Response(
+            text="OK"
+        )
+
+    web_app.router.add_get(
+        "/health",
+        health
+    )
+
+    web_app.router.add_post(
+        webhook_path,
+        telegram_webhook
+    )
+
+    runner = web.AppRunner(
+        web_app
+    )
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
+    )
+
+    await site.start()
+
+    logger.info(
+        "Bot started on port %s",
+        PORT
+    )
+
+    try:
+
+        await asyncio.Event().wait()
+
+    finally:
+
+        await application.bot.delete_webhook()
+
+        await runner.cleanup()
+
+        await application.stop()
+
+        await application.shutdown()
+
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
-    main()
+
+    asyncio.run(
+        main()
+    )
