@@ -1195,6 +1195,10 @@ async def handle_admin_state(update, context):
 
     if text == "🔙 لغو / بازگشت":
 
+        # -----------------------------------------------
+        # اگر داخل یک عملیات هستیم
+        # -----------------------------------------------
+
         if state:
 
             context.user_data.clear()
@@ -1232,6 +1236,10 @@ async def handle_admin_state(update, context):
 
             return True
 
+        # -----------------------------------------------
+        # اگر خود صفحه مدیریت دکمه‌ها هستیم
+        # -----------------------------------------------
+
         if admin_section == "button_management":
 
             context.user_data.clear()
@@ -1243,6 +1251,10 @@ async def handle_admin_state(update, context):
 
             return True
 
+        # -----------------------------------------------
+        # اگر صفحه مدیریت ادمین‌ها هستیم
+        # -----------------------------------------------
+
         if admin_section == "admin_management":
 
             context.user_data.clear()
@@ -1253,6 +1265,10 @@ async def handle_admin_state(update, context):
             )
 
             return True
+
+        # -----------------------------------------------
+        # حالت عادی
+        # -----------------------------------------------
 
         context.user_data.clear()
 
@@ -1554,6 +1570,10 @@ async def handle_admin_state(update, context):
 
     if state == "add_file":
 
+        # -----------------------------------------------
+        # Create the button ONLY ONCE
+        # -----------------------------------------------
+
         button_id = await create_button(
             title=context.user_data["title"],
             kind="file",
@@ -1563,6 +1583,10 @@ async def handle_admin_state(update, context):
             source_chat_id=message.chat_id,
             source_message_id=message.message_id
         )
+
+        # -----------------------------------------------
+        # Save first file in multiple-file table
+        # -----------------------------------------------
 
         await add_file_to_button(
             button_id=button_id,
@@ -1622,9 +1646,8 @@ async def handle_admin_state(update, context):
             "📁 حالا فایل یا پیام جدید را بفرست.\n\n"
             "✅ فایل جدید به فایل‌های قبلی اضافه می‌شود.\n"
             "❌ هیچ فایل قبلی حذف یا جایگزین نمی‌شود.\n\n"
-            "📌 می‌توانی چند فایل را با هم انتخاب و ارسال کنی.\n"
-            "همه فایل‌ها به همین دکمه اضافه خواهند شد.\n\n"
-            "🔙 وقتی تمام شد، «لغو / بازگشت» را بزن.",
+            "هر بار که خواستی می‌توانی دوباره همین گزینه "
+            "را انتخاب کنی و فایل دیگری اضافه کنی.",
             reply_markup=back_keyboard()
         )
 
@@ -1636,42 +1659,24 @@ async def handle_admin_state(update, context):
 
     if state == "change_file":
 
-    button_id = context.user_data.get(
-        "button_id"
-    )
-
-    if not button_id:
-
-        context.user_data.clear()
-
-        await message.reply_text(
-            "❌ خطا در انتخاب دکمه.",
-            reply_markup=button_management_keyboard()
+        button_id = context.user_data.get(
+            "button_id"
         )
 
-        return True
+        if not button_id:
 
-    await add_file_to_button(
-        button_id=button_id,
-        source_chat_id=message.chat_id,
-        source_message_id=message.message_id
-    )
+            context.user_data.clear()
 
-    # -------------------------------------------------
-    # SUCCESS MESSAGE
-    # -------------------------------------------------
+            await message.reply_text(
+                "❌ خطا در انتخاب دکمه.",
+                reply_markup=button_management_keyboard()
+            )
 
-    await message.reply_text(
-        "✅ فایل / پیام با موفقیت ثبت شد.\n\n"
-        "📁 فایل‌های قبلی همچنان باقی هستند.\n"
-        "➕ فایل بعدی را هم می‌توانی ارسال کنی.\n\n"
-        "🔙 وقتی تمام شد، «لغو / بازگشت» را بزن."
-    )
-
-    return True
+            return True
 
         # -------------------------------------------------
-        # ADD EVERY NEW MESSAGE AS A NEW FILE
+        # IMPORTANT:
+        # INSERT instead of UPDATE
         # -------------------------------------------------
 
         await add_file_to_button(
@@ -1680,13 +1685,13 @@ async def handle_admin_state(update, context):
             source_message_id=message.message_id
         )
 
-        # -------------------------------------------------
-        # IMPORTANT:
-        # DO NOT CLEAR context.user_data
-        #
-        # The state remains "change_file",
-        # so the next selected file is also saved.
-        # -------------------------------------------------
+        context.user_data.clear()
+
+        await message.reply_text(
+            "✅ فایل / پیام جدید اضافه شد.\n\n"
+            "📁 فایل‌های قبلی همچنان باقی هستند.",
+            reply_markup=button_management_keyboard()
+        )
 
         return True
 
@@ -2010,6 +2015,8 @@ async def handle_admin_state(update, context):
 
         button_id = row["id"]
 
+        # Delete all files belonging to button first
+
         query(
             """
             DELETE FROM button_files
@@ -2017,6 +2024,8 @@ async def handle_admin_state(update, context):
             """,
             (button_id,)
         )
+
+        # Delete button
 
         query(
             """
@@ -2082,6 +2091,9 @@ async def admin_text_router(update, context):
         )
 
         context.user_data.clear()
+
+        # IMPORTANT:
+        # Management -> Main Admin Panel
 
         if section == "button_management":
 
