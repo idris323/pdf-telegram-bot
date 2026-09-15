@@ -49,6 +49,8 @@ ADMIN_CACHE = {ADMIN_ID}
 USER_CACHE = set()
 START_TEXT_CACHE = None
 CLEANUP_TASK = None
+BUTTON_CACHE = {}
+BUTTON_LOOKUP_CACHE = {}
 AFGHAN_TZ = ZoneInfo("Asia/Kabul")
 
 
@@ -66,9 +68,10 @@ def init_db_pool():
         db_pool = ConnectionPool(
             conninfo=DATABASE_URL,
             min_size=1,
-            max_size=5,
+            max_size=10,
             kwargs={
-                "row_factory": dict_row
+                "row_factory": dict_row,
+                "autocommit": True
             }
         )
 
@@ -99,7 +102,6 @@ def query(sql, params=(), fetch=False, one=False):
 
                 return rows
 
-        connection.commit()
 
     return None
 
@@ -160,6 +162,26 @@ def init_admin_table():
     # latest_today = only today's files
     # latest_week  = only this week's files
     # -----------------------------------------------------
+
+    # FAST LOOKUP INDEXES
+    query(
+        """
+        CREATE INDEX IF NOT EXISTS idx_buttons_parent_sort
+        ON buttons(parent_id, sort_order, id)
+        """
+    )
+    query(
+        """
+        CREATE INDEX IF NOT EXISTS idx_buttons_title_parent
+        ON buttons(parent_id, title)
+        """
+    )
+    query(
+        """
+        CREATE INDEX IF NOT EXISTS idx_button_files_button_added
+        ON button_files(button_id, added_at, id)
+        """
+    )
 
     query(
         """
@@ -272,21 +294,12 @@ def cleanup_special_files():
         DELETE FROM button_files bf
         USING buttons b
         WHERE bf.button_id = b.id
-          AND b.kind = 'latest_today'
-          AND bf.added_at < %s
+          AND (
+                (b.kind = 'latest_today' AND bf.added_at < %s)
+             OR (b.kind = 'latest_week' AND bf.added_at < %s)
+          )
         """,
-        (today_start,)
-    )
-
-    query(
-        """
-        DELETE FROM button_files bf
-        USING buttons b
-        WHERE bf.button_id = b.id
-          AND b.kind = 'latest_week'
-          AND bf.added_at < %s
-        """,
-        (week_start,)
+        (today_start, week_start)
     )
 
     logger.info("Special file cleanup completed.")
@@ -390,16 +403,20 @@ def back_keyboard():
 
 def user_keyboard(parent_id=None, page=0):
 
-    buttons = query(
-        """
-        SELECT id, title, kind
-        FROM buttons
-        WHERE parent_id IS NOT DISTINCT FROM %s
-        ORDER BY sort_order, id
-        """,
-        (parent_id,),
-        fetch=True
-    )
+    cache_key = parent_id
+    buttons = BUTTON_CACHE.get(cache_key)
+    if buttons is None:
+        buttons = query(
+            """
+            SELECT id, title, kind
+            FROM buttons
+            WHERE parent_id IS NOT DISTINCT FROM %s
+            ORDER BY sort_order, id
+            """,
+            (parent_id,),
+            fetch=True
+        )
+        BUTTON_CACHE[cache_key] = buttons
 
     per_page = 8
 
@@ -619,6 +636,15 @@ async def show_root(update):
 
 
 # =========================================================
+# FAST CACHE HELPERS
+# =========================================================
+
+def invalidate_button_cache(parent_id=None):
+    BUTTON_CACHE.clear()
+    BUTTON_LOOKUP_CACHE.clear()
+
+
+# =========================================================
 # CREATE BUTTON
 # =========================================================
 
@@ -673,6 +699,7 @@ async def create_button(
         one=True
     )
 
+    invalidate_button_cache(parent_id)
     return row["id"]
 
 
@@ -2089,11 +2116,9 @@ async def handle_admin_state(update, context):
             SET title = %s
             WHERE id = %s
             """,
-            (
-                new_title,
-                context.user_data["button_id"]
-            )
+            (new_title, context.user_data["button_id"])
         )
+        invalidate_button_cache()
 
         context.user_data.clear()
 
@@ -2148,6 +2173,7 @@ async def handle_admin_state(update, context):
             """,
             (button_id,)
         )
+        invalidate_button_cache()
 
         context.user_data.clear()
 
@@ -2492,22 +2518,23 @@ async def user_router(update, context):
         "menu_parent"
     )
 
-    button = query(
-        """
-        SELECT *
-        FROM buttons
-        WHERE parent_id IS NOT DISTINCT FROM %s
-        AND title = %s
-        ORDER BY id
-        LIMIT 1
-        """,
-        (
-            parent_id,
-            text
-        ),
-        fetch=True,
-        one=True
-    )
+    lookup_key = (parent_id, text)
+    button = BUTTON_LOOKUP_CACHE.get(lookup_key)
+    if button is None:
+        button = query(
+            """
+            SELECT *
+            FROM buttons
+            WHERE parent_id IS NOT DISTINCT FROM %s
+            AND title = %s
+            ORDER BY id
+            LIMIT 1
+            """,
+            (parent_id, text),
+            fetch=True,
+            one=True
+        )
+        BUTTON_LOOKUP_CACHE[lookup_key] = button
 
     if not button:
         return
@@ -2541,8 +2568,6 @@ async def user_router(update, context):
     # =====================================================
 
     if button["kind"] == "latest_today":
-        cleanup_special_files()
-
         today_start = local_now().replace(
             hour=0, minute=0, second=0, microsecond=0
         )
@@ -2596,8 +2621,6 @@ async def user_router(update, context):
     # =====================================================
 
     if button["kind"] == "latest_week":
-        cleanup_special_files()
-
         now = local_now()
         week_start = now.replace(
             hour=0, minute=0, second=0, microsecond=0
